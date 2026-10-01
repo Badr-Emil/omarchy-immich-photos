@@ -709,38 +709,6 @@ Panel {
               onClicked: root.show("settings")
             }
           }
-
-          PanelSeparator { foreground: root.foreground }
-
-          Column {
-            width: parent.width
-            spacing: Style.space(4)
-
-            PanelSectionHeader {
-              text: "SERVER"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            InfoRow {
-              visible: root.status !== null && root.status.server.version !== null
-              label: "Immich"
-              value: root.status && root.status.server.version ? "v" + root.status.server.version : ""
-            }
-
-            InfoRow {
-              label: "Docker"
-              value: root.status && root.status.docker.daemonActive ? "running" : "not running"
-              alert: root.status !== null && !root.status.docker.daemonActive
-            }
-
-            InfoRow {
-              label: "Database"
-              value: root.status && root.status.database.status === "reachable"
-                ? (root.status.database.inferred ? "reachable (server answers)" : "reachable")
-                : "unknown"
-            }
-          }
         }
 
         // ---------- Phone setup ----------
@@ -977,6 +945,25 @@ Panel {
             text: "SERVER"
             foreground: root.foreground
             fontFamily: root.fontFamily
+          }
+
+          InfoRow {
+            visible: root.status !== null && root.status.server.version !== null
+            label: "Immich"
+            value: root.status && root.status.server.version ? "v" + root.status.server.version : ""
+          }
+
+          InfoRow {
+            label: "Docker"
+            value: root.status && root.status.docker.daemonActive ? "running" : "not running"
+            alert: root.status !== null && !root.status.docker.daemonActive
+          }
+
+          InfoRow {
+            label: "Database"
+            value: root.status && root.status.database.status === "reachable"
+              ? (root.status.database.inferred ? "reachable (server answers)" : "reachable")
+              : "unknown"
           }
 
           Button {

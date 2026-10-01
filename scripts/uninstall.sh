@@ -32,6 +32,8 @@ media=$(field storage.path)
 database=""
 if [[ -n $compose_dir && -f $compose_dir/.env ]]; then
   database=$(sed -n 's/^DB_DATA_LOCATION=//p' "$compose_dir/.env")
+  # Relative locations in .env are relative to the compose folder.
+  [[ -n $database && $database != /* ]] && database="$compose_dir/${database#./}"
 fi
 
 if ask "Remove the plugin from the Omarchy bar?" y; then
