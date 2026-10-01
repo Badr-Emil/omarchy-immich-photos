@@ -36,6 +36,7 @@ Panel {
   readonly property bool online: serverState === "online" || serverState === "busy"
   readonly property bool installed: status !== null && status.installed === true
   readonly property int pendingJobs: status && status.jobs ? Number(status.jobs.pending) || 0 : 0
+  readonly property var busyQueues: status && status.jobs && status.jobs.queues ? status.jobs.queues : []
   readonly property string serverUrl: status && status.server.url ? String(status.server.url) : ""
   readonly property bool qrReady: serverUrl !== "" && qrUrl === serverUrl
   readonly property bool hasKey: status !== null && status.capabilities.apiKey === true
@@ -85,6 +86,12 @@ Panel {
     case "low-space": return "Storage is running low."
     }
     return String(note.text || "")
+  }
+
+  // "thumbnailGeneration" -> "Thumbnail generation"
+  function queueLabel(name) {
+    var words = String(name || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase()
+    return words.charAt(0).toUpperCase() + words.slice(1)
   }
 
   function formatBytes(value) {
@@ -299,7 +306,7 @@ Panel {
   }
 
   Timer {
-    interval: root.busyAction !== "" ? 2000 : root.refreshInterval
+    interval: root.busyAction !== "" || root.opened || root.pendingJobs > 0 ? 2000 : root.refreshInterval
     running: true
     repeat: true
     triggeredOnStart: true
@@ -567,15 +574,52 @@ Panel {
             }
 
             InfoRow {
-              visible: root.status !== null && root.status.jobs !== null
-              label: "Jobs in progress"
-              value: String(root.pendingJobs)
-            }
-
-            InfoRow {
               visible: root.status !== null && root.status.lastActivity !== null
               label: "Phone last seen"
               value: root.status && root.status.lastActivity ? root.formatLastSeen(root.status.lastActivity) : ""
+            }
+          }
+
+          // What the server is working on right now, refreshed every two seconds
+          // while the panel is open or work is pending.
+          Column {
+            visible: root.status !== null && root.status.jobs !== null
+            width: parent.width
+            spacing: Style.space(4)
+
+            PanelSeparator { foreground: root.foreground }
+
+            PanelSectionHeader {
+              text: root.pendingJobs > 0 ? "JOBS · " + root.formatCount(root.pendingJobs) + " PENDING" : "JOBS"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            InfoRow {
+              visible: root.pendingJobs === 0
+              label: "Server"
+              value: "idle, nothing to process"
+            }
+
+            Repeater {
+              model: root.busyQueues.slice(0, 4)
+              InfoRow {
+                required property var modelData
+                label: root.queueLabel(modelData.name) + (modelData.paused ? " (paused)" : "")
+                value: root.formatCount(modelData.active) + " running · " + root.formatCount(modelData.waiting) + " waiting"
+              }
+            }
+
+            InfoRow {
+              visible: root.busyQueues.length > 4
+              label: "Other queues"
+              value: String(root.busyQueues.length - 4)
+            }
+
+            InfoRow {
+              visible: root.status !== null && root.status.jobs !== null && root.status.jobs.failed > 0
+              label: "Failed so far"
+              value: root.status && root.status.jobs ? root.formatCount(root.status.jobs.failed) : ""
             }
           }
 

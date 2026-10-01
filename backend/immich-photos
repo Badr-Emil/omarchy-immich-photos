@@ -557,9 +557,11 @@ def summarize_queues(queues):
         stats = queue.get("statistics") or {}
         for key in totals:
             totals[key] += int(stats.get(key) or 0)
-        pending = int(stats.get("active") or 0) + int(stats.get("waiting") or 0)
+        counts = {key: int(stats.get(key) or 0) for key in ("active", "waiting", "delayed", "paused")}
+        pending = sum(counts.values())
         if pending:
-            busy.append({"name": queue.get("name"), "pending": pending, "paused": bool(queue.get("isPaused"))})
+            busy.append({"name": queue.get("name"), "pending": pending, "active": counts["active"],
+                         "waiting": pending - counts["active"], "paused": bool(queue.get("isPaused"))})
     totals["pending"] = totals["active"] + totals["waiting"] + totals["delayed"] + totals["paused"]
     totals["queues"] = sorted(busy, key=lambda item: -item["pending"])
     return totals

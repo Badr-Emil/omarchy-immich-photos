@@ -297,6 +297,10 @@ class StatusParsing(unittest.TestCase):
         self.assertEqual(summary["failed"], 1)
         self.assertEqual(summary["pending"], 26)
         self.assertEqual([queue["name"] for queue in summary["queues"]], ["thumbnailGeneration", "videoConversion"])
+        self.assertEqual(summary["queues"][0], {"name": "thumbnailGeneration", "pending": 22, "active": 2,
+                                                "waiting": 20, "paused": False})
+        self.assertEqual(summary["queues"][1]["pending"], 4)
+        self.assertEqual(sum(queue["pending"] for queue in summary["queues"]), summary["pending"])
 
     def test_queue_summary_of_idle_server(self):
         self.assertEqual(ip.summarize_queues([])["pending"], 0)
