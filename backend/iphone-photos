@@ -1,0 +1,1229 @@
+#!/usr/bin/env python3
+"""Management and monitoring CLI for a local Immich server.
+
+The photo pipeline is iPhone -> Immich iOS app -> Immich server. This tool is
+not part of it: it installs the official Immich compose stack, starts and stops
+it, and reports what the Immich API and the local system can actually tell.
+"""
+
+import sys
+
+sys.dont_write_bytecode = True
+
+import argparse
+import getpass
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import string
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+APP = "omarchy-iphone-photos"
+CONTAINER_PORT = 2283
+# The compose file runs as root through Docker, so it is pinned to a release
+# and checked against the hashes below instead of following "latest". A newer
+# Immich release is adopted by updating these three values in a plugin commit.
+IMMICH_RELEASE = "v3.2.4"
+RELEASE_URL = "https://github.com/immich-app/immich/releases/download/%s/" % IMMICH_RELEASE
+RELEASE_SHA256 = {
+    "docker-compose.yml": "fa98c3eb0884b0b88aaee11a9c9acb8cfb17a0f495d12c21358deb6d3e8a546b",
+    "example.env": "dda820cecbcf5fd5d6afecc54107bbd3c973088c631d380dfc83e9f0f2c6b210",
+}
+DOCKER_SOCKET = "/var/run/docker.sock"
+
+GIB = 1024**3
+MIN_FREE_BYTES = 1 * GIB
+LOW_FREE_BYTES = 20 * GIB
+
+# Filesystems without Unix ownership and permissions, which Immich requires.
+UNSUITABLE_FS = {"vfat", "exfat", "msdos", "ntfs", "ntfs3", "fuseblk", "iso9660", "udf"}
+NETWORK_FS = {"nfs", "nfs4", "cifs", "smb3", "smbfs", "9p", "ceph", "glusterfs", "davfs"}
+VOLATILE_FS = {"tmpfs", "ramfs", "devtmpfs", "proc", "sysfs", "overlay"}
+# Places that only make sense as a mount point of a separate disk.
+MOUNT_PARENTS = ("/mnt", "/media", "/run/media")
+SYSTEM_PATHS = ("/boot", "/dev", "/etc", "/proc", "/run", "/sys", "/tmp", "/usr", "/var/lib/docker")
+IMMICH_LIBRARY_DIRS = {"library", "upload", "thumbs", "encoded-video", "profile", "backups"}
+
+
+# --------------------------------------------------------------------------
+# Paths and configuration
+# --------------------------------------------------------------------------
+
+def config_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP
+
+
+def data_dir():
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / APP
+
+
+def default_compose_dir():
+    return data_dir() / "immich"
+
+
+def load_config():
+    try:
+        config = json.loads((config_dir() / "config.json").read_text())
+        return config if isinstance(config, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(config):
+    config_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_private(config_dir() / "config.json", json.dumps(config, indent=2) + "\n")
+
+
+def write_private(path, text):
+    """Write a file that only the owner can read, without a readable window."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    os.chmod(path, 0o600)
+
+
+def parse_env(text):
+    """Parse a docker compose .env file into a dict."""
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        else:
+            value = re.sub(r"\s+#.*$", "", value)
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            values[key] = value
+    return values
+
+
+def parse_host_port(compose_text):
+    """Host port that the compose file publishes for the Immich server."""
+    match = re.search(
+        r"^\s*-\s*['\"]?(?:[0-9.]+:)?(\d+):%d(?:/tcp)?['\"]?\s*$" % CONTAINER_PORT,
+        compose_text,
+        re.MULTILINE,
+    )
+    return int(match.group(1)) if match else CONTAINER_PORT
+
+
+def is_immich_compose(directory):
+    for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
+        path = Path(directory) / name
+        try:
+            if "immich-server" in path.read_text():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+class Installation:
+    """What is known about the Immich compose project on this machine."""
+
+    def __init__(self, compose_dir):
+        self.compose_dir = Path(compose_dir)
+        self.compose_file = is_immich_compose(self.compose_dir)
+        self.env = {}
+        self.port = CONTAINER_PORT
+        if self.compose_file:
+            try:
+                self.port = parse_host_port(self.compose_file.read_text())
+                self.env = parse_env((self.compose_dir / ".env").read_text())
+            except OSError:
+                pass
+
+    @property
+    def installed(self):
+        return self.compose_file is not None
+
+    def _location(self, key):
+        value = self.env.get(key)
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else (self.compose_dir / path).resolve()
+
+    @property
+    def media_path(self):
+        return self._location("UPLOAD_LOCATION")
+
+    @property
+    def db_path(self):
+        return self._location("DB_DATA_LOCATION")
+
+
+def find_installation(config=None):
+    """Locate an Immich compose project: configured, ours, or a common place."""
+    config = load_config() if config is None else config
+    candidates = []
+    if config.get("composeDir"):
+        candidates.append(Path(config["composeDir"]))
+    candidates.append(default_compose_dir())
+    home = Path.home()
+    candidates += [home / "immich-app", home / "immich", home / "docker/immich",
+                   Path("/opt/immich"), Path("/opt/immich-app"), Path("/srv/immich")]
+    for directory in running_compose_dirs():
+        candidates.append(directory)
+    for candidate in candidates:
+        installation = Installation(candidate)
+        if installation.installed:
+            return installation
+    return Installation(candidates[0])
+
+
+# --------------------------------------------------------------------------
+# System probes
+# --------------------------------------------------------------------------
+
+def run(command, timeout=10):
+    """Run a command, returning (exit code, stdout, stderr). Never raises."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        return result.returncode, result.stdout.strip(), result.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", "%s: command not found" % command[0]
+    except subprocess.TimeoutExpired:
+        return 124, "", "%s: timed out" % command[0]
+
+
+def docker_installed():
+    return shutil.which("docker") is not None
+
+
+def docker_direct():
+    """True when this user may talk to the Docker daemon without a prompt."""
+    return os.access(DOCKER_SOCKET, os.R_OK | os.W_OK)
+
+
+def docker_daemon_active():
+    code, out, _ = run(["systemctl", "is-active", "docker.service"])
+    return out == "active"
+
+
+def docker_enabled_at_boot():
+    code, out, _ = run(["systemctl", "is-enabled", "docker.service"])
+    return out == "enabled"
+
+
+def compose_version():
+    code, out, _ = run(["docker", "compose", "version", "--short"])
+    return out if code == 0 and out else None
+
+
+def engine_version():
+    code, out, _ = run(["docker", "--version"])
+    match = re.search(r"version\s+([^\s,]+)", out)
+    return match.group(1) if code == 0 and match else None
+
+
+def running_compose_dirs():
+    """Directories of compose projects named like Immich. Needs daemon access."""
+    if not (docker_installed() and docker_direct()):
+        return []
+    code, out, _ = run(["docker", "compose", "ls", "-a", "--format", "json"])
+    if code != 0:
+        return []
+    try:
+        projects = json.loads(out)
+    except ValueError:
+        return []
+    directories = []
+    for project in projects:
+        if "immich" in str(project.get("Name", "")).lower():
+            for config_file in str(project.get("ConfigFiles", "")).split(","):
+                if config_file:
+                    directories.append(Path(config_file).parent)
+    return directories
+
+
+def container_states(installation):
+    """Per-container state, or None when the daemon is not accessible."""
+    if not (installation.installed and docker_installed() and docker_direct()):
+        return None
+    code, out, _ = run(["docker", "compose", "--project-directory", str(installation.compose_dir),
+                        "ps", "-a", "--format", "json"])
+    if code != 0:
+        return None
+    return parse_compose_ps(out)
+
+
+def parse_compose_ps(output):
+    """`docker compose ps --format json` prints a JSON array or one object per line."""
+    output = output.strip()
+    if not output:
+        return []
+    try:
+        rows = json.loads(output)
+        rows = rows if isinstance(rows, list) else [rows]
+    except ValueError:
+        rows = []
+        for line in output.splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return [{"name": row.get("Name", ""), "service": row.get("Service", ""),
+             "state": row.get("State", ""), "health": row.get("Health", "")}
+            for row in rows if isinstance(row, dict)]
+
+
+def port_listening(port, host="127.0.0.1"):
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def outbound_address():
+    """Address of the interface that carries the default route. Sends nothing."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def lan_ip(candidate=None):
+    """Private LAN address of this PC, or None when there is none.
+
+    Rejects loopback, link-local, public and carrier-grade NAT addresses, so a
+    VPN address such as Tailscale's 100.64.0.0/10 is never offered to the phone.
+    """
+    candidate = outbound_address() if candidate is None else candidate
+    try:
+        address = ipaddress.ip_address(candidate)
+    except (TypeError, ValueError):
+        return None
+    if address.version != 4 or address.is_loopback or address.is_link_local or not address.is_private:
+        return None
+    return str(address)
+
+
+def mount_info(path):
+    """Mount that holds `path`: target, source, fstype, options."""
+    code, out, _ = run(["findmnt", "-J", "-T", str(path), "-o", "TARGET,SOURCE,FSTYPE,OPTIONS"])
+    if code != 0:
+        return None
+    try:
+        entry = json.loads(out)["filesystems"][0]
+    except (ValueError, KeyError, IndexError):
+        return None
+    return {"target": entry.get("target"), "source": entry.get("source"),
+            "fstype": entry.get("fstype"), "options": (entry.get("options") or "").split(",")}
+
+
+def disk_usage(path):
+    stats = os.statvfs(path)
+    total = stats.f_blocks * stats.f_frsize
+    free = stats.f_bavail * stats.f_frsize
+    return {"totalBytes": total, "freeBytes": free, "usedBytes": compute_used(stats)}
+
+
+def compute_used(stats):
+    """Bytes in use the way `df` counts them: total minus free for root."""
+    return (stats.f_blocks - stats.f_bfree) * stats.f_frsize
+
+
+def nearest_existing(path):
+    path = Path(path)
+    while not path.exists():
+        if path.parent == path:
+            break
+        path = path.parent
+    return path
+
+
+def looks_like_library(path):
+    """True when the directory already holds an Immich library with content."""
+    path = Path(path)
+    try:
+        names = {entry.name for entry in path.iterdir()}
+    except OSError:
+        return False
+    if not names & {"library", "upload"}:
+        return False
+    for name in ("library", "upload"):
+        try:
+            for user_dir in (path / name).iterdir():
+                if user_dir.is_dir() and any(user_dir.iterdir()):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def check_storage(path, purpose="media", mount_lookup=mount_info, usage_lookup=disk_usage):
+    """Decide whether `path` is a safe place for the media or the database.
+
+    Returns a dict with `ok`, `errors`, `warnings` and what was found. Nothing
+    is created or changed.
+    """
+    result = {"path": str(path), "purpose": purpose, "ok": False, "exists": False, "writable": False,
+              "mounted": False, "mountPoint": None, "device": None, "filesystem": None,
+              "network": False, "totalBytes": None, "usedBytes": None, "freeBytes": None,
+              "existingLibrary": False, "empty": True, "errors": [], "warnings": []}
+    errors, warnings = result["errors"], result["warnings"]
+
+    raw = str(path).strip()
+    if not raw:
+        errors.append("No path given.")
+        return result
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        errors.append("The path must be absolute, for example %s." % (Path.home() / "Pictures/Immich"))
+        return result
+    target = Path(os.path.normpath(target))
+    result["path"] = str(target)
+
+    if str(target) == "/":
+        errors.append("The filesystem root is not a valid location.")
+        return result
+    for system_path in SYSTEM_PATHS:
+        if target == Path(system_path) or Path(system_path) in target.parents:
+            errors.append("%s is a system directory and not a place for photos." % system_path)
+            return result
+
+    result["exists"] = target.is_dir()
+    if target.exists() and not target.is_dir():
+        errors.append("%s exists but is not a directory." % target)
+        return result
+
+    anchor = nearest_existing(target)
+    mount = mount_lookup(anchor)
+    if not mount or not mount.get("fstype"):
+        errors.append("Could not determine which filesystem holds %s." % anchor)
+        return result
+    fstype = mount["fstype"]
+    result.update(mounted=True, mountPoint=mount.get("target"), device=mount.get("source"), filesystem=fstype)
+
+    for parent in MOUNT_PARENTS:
+        if (target == Path(parent) or Path(parent) in target.parents) and mount.get("target") == "/":
+            result["mounted"] = False
+            errors.append(
+                "No disk is mounted at this location: %s lies on the system disk. "
+                "Mount the drive first, then check again." % target)
+            return result
+
+    base_type = fstype.split(".")[0]
+    if base_type in VOLATILE_FS:
+        errors.append("%s is a temporary filesystem (%s). Data would be lost on reboot." % (mount["target"], fstype))
+    if fstype in UNSUITABLE_FS:
+        errors.append("Filesystem %s has no Unix ownership and permissions, which Immich requires." % fstype)
+    if base_type in NETWORK_FS or fstype in ("fuse.sshfs", "fuse.rclone"):
+        result["network"] = True
+        if purpose == "database":
+            errors.append("The database must not live on a network share (%s)." % fstype)
+        else:
+            warnings.append("Network share (%s): uploads stop when the share is unavailable." % fstype)
+    if "ro" in mount.get("options", []):
+        errors.append("%s is mounted read-only." % mount["target"])
+
+    result["writable"] = os.access(anchor, os.W_OK | os.X_OK)
+    if not result["writable"]:
+        errors.append("Your user cannot write to %s." % anchor)
+
+    try:
+        result.update(usage_lookup(anchor))
+    except OSError as error:
+        errors.append("Could not read free space of %s: %s." % (anchor, error.strerror))
+    else:
+        free = result["freeBytes"]
+        if free < MIN_FREE_BYTES:
+            errors.append("Storage is full: only %s free on %s." % (format_bytes(free), mount["target"]))
+        elif free < LOW_FREE_BYTES:
+            warnings.append("Only %s free on %s." % (format_bytes(free), mount["target"]))
+
+    if result["exists"]:
+        try:
+            entries = [entry.name for entry in target.iterdir()]
+        except OSError:
+            entries = []
+        result["empty"] = not entries
+        result["existingLibrary"] = looks_like_library(target)
+        if result["existingLibrary"]:
+            warnings.append("This folder already contains an Immich library. It will not be modified.")
+        elif entries and not set(entries) <= IMMICH_LIBRARY_DIRS:
+            warnings.append("This folder is not empty. Immich will add its own subfolders next to the existing files.")
+
+    result["ok"] = not errors
+    return result
+
+
+# --------------------------------------------------------------------------
+# Immich API
+# --------------------------------------------------------------------------
+
+class ApiError(Exception):
+    def __init__(self, kind, message, status=None):
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+
+
+class ImmichApi:
+    """Minimal client for the documented Immich REST API (OpenAPI v3.x)."""
+
+    def __init__(self, base_url, api_key=None, timeout=4):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def get(self, path, authenticated=False):
+        request = urllib.request.Request(self.base_url + "/api" + path, headers={"Accept": "application/json"})
+        if authenticated:
+            if not self.api_key:
+                raise ApiError("no-key", "No API key configured.")
+            request.add_header("x-api-key", self.api_key)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as error:
+            if error.code == 401:
+                raise ApiError("unauthorized", "The API key was rejected.", 401)
+            if error.code == 403:
+                raise ApiError("forbidden", "The API key lacks the permission for %s." % path, 403)
+            raise ApiError("http", "Immich answered %s with HTTP %d." % (path, error.code), error.code)
+        except (TimeoutError, socket.timeout):
+            raise ApiError("timeout", "Immich did not answer within %d seconds." % self.timeout)
+        except (urllib.error.URLError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise ApiError("timeout", "Immich did not answer within %d seconds." % self.timeout)
+            raise ApiError("unreachable", "Immich is not reachable at %s." % self.base_url)
+        try:
+            return json.loads(body)
+        except ValueError:
+            raise ApiError("invalid", "Immich returned something that is not JSON for %s." % path)
+
+    def ping(self):
+        return self.get("/server/ping").get("res") == "pong"
+
+    def version(self):
+        data = self.get("/server/version")
+        return "%s.%s.%s" % (data["major"], data["minor"], data["patch"])
+
+
+def read_api_key():
+    try:
+        key = (config_dir() / "api-key").read_text().strip()
+        return key or None
+    except OSError:
+        return None
+
+
+def summarize_queues(queues):
+    """Reduce GET /queues to totals plus the queues that have work."""
+    totals = {"active": 0, "waiting": 0, "delayed": 0, "failed": 0, "paused": 0}
+    busy = []
+    for queue in queues:
+        stats = queue.get("statistics") or {}
+        for key in totals:
+            totals[key] += int(stats.get(key) or 0)
+        pending = int(stats.get("active") or 0) + int(stats.get("waiting") or 0)
+        if pending:
+            busy.append({"name": queue.get("name"), "pending": pending, "paused": bool(queue.get("isPaused"))})
+    totals["pending"] = totals["active"] + totals["waiting"] + totals["delayed"] + totals["paused"]
+    totals["queues"] = sorted(busy, key=lambda item: -item["pending"])
+    return totals
+
+
+def summarize_sessions(sessions):
+    """Devices signed in to the account and when the server last saw them.
+
+    Immich refreshes a session's timestamp at most once per hour, so "last
+    seen" is accurate to about an hour.
+    """
+    devices = []
+    for session in sessions:
+        if not (session.get("deviceType") or session.get("deviceOS")):
+            continue
+        devices.append({"deviceType": session.get("deviceType") or "", "deviceOS": session.get("deviceOS") or "",
+                        "appVersion": session.get("appVersion"), "lastSeen": session.get("updatedAt")})
+    devices.sort(key=lambda device: device["lastSeen"] or "", reverse=True)
+    return devices
+
+
+def is_iphone(device):
+    return "ios" in device["deviceOS"].lower() or "iphone" in device["deviceType"].lower()
+
+
+def derive_state(installed, docker_present, daemon_active, port_open, ping_ok, maintenance=False, pending_jobs=0):
+    """Single word describing the whole setup, plus what to tell the user."""
+    if not docker_present:
+        return ("no-docker", "Docker is not installed.",
+                "Install it with: omarchy pkg add docker docker-compose")
+    if not installed:
+        return ("not-installed", "Immich is not installed.", "Run scripts/install.sh")
+    if ping_ok:
+        if maintenance:
+            return ("problem", "Immich is in maintenance mode.", "Open the web interface to finish maintenance.")
+        if pending_jobs:
+            return ("busy", "Immich is online and processing %d jobs." % pending_jobs, "")
+        return ("online", "Immich is online.", "")
+    if not daemon_active:
+        return ("stopped", "Immich server is not reachable.\nThe Docker daemon is not running.",
+                "iphone-photos server start")
+    if not port_open:
+        return ("stopped", "Immich server is not reachable.\nDocker container immich_server is stopped.",
+                "iphone-photos server start")
+    return ("problem", "Immich server is not answering.\nThe port is open but the API does not respond; "
+            "the server may still be starting.", "iphone-photos server logs")
+
+
+# --------------------------------------------------------------------------
+# Status
+# --------------------------------------------------------------------------
+
+def note(notes, code, text):
+    """A hint for the user: `code` for the panel, `text` for the terminal."""
+    notes.append({"code": code, "text": text})
+
+
+def collect_status(installation=None):
+    installation = installation or find_installation()
+    port = installation.port
+    local_url = "http://localhost:%d" % port
+    address = lan_ip()
+    direct = docker_direct()
+    api_key = read_api_key()
+    api = ImmichApi("http://127.0.0.1:%d" % port, api_key)
+    notes = []
+    library_bytes = None
+
+    status = {
+        "schema": 1,
+        "installed": installation.installed,
+        "composeDir": str(installation.compose_dir) if installation.installed else None,
+        "server": {"online": False, "version": None, "initialized": None, "maintenanceMode": None,
+                   "port": port, "portListening": port_listening(port), "lanIp": address,
+                   "localUrl": local_url, "url": "http://%s:%d" % (address, port) if address else None},
+        "docker": {"installed": docker_installed(), "daemonActive": docker_daemon_active(),
+                   "enabledAtBoot": docker_enabled_at_boot(), "direct": direct,
+                   "containers": container_states(installation)},
+        "database": {"status": "unknown", "inferred": True},
+        "storage": None,
+        "library": None,
+        "jobs": None,
+        "devices": None,
+        "lastActivity": None,
+        "capabilities": {"dockerDirect": direct, "apiKey": api_key is not None,
+                         "userApi": False, "adminApi": False},
+        "notes": notes,
+    }
+    server = status["server"]
+
+    if installation.installed:
+        try:
+            server["online"] = api.ping()
+        except ApiError:
+            server["online"] = False
+    if server["online"]:
+        status["database"]["status"] = "reachable"
+        try:
+            server["version"] = api.version()
+            config = api.get("/server/config")
+            server["initialized"] = bool(config.get("isInitialized"))
+            server["maintenanceMode"] = bool(config.get("maintenanceMode"))
+        except (ApiError, KeyError, TypeError):
+            pass
+        if server["initialized"] is False:
+            note(notes, "no-admin", "No admin account yet. Open %s and create one." % local_url)
+        elif not api_key:
+            note(notes, "no-key", "No API key configured: photo counts and job status are not available. "
+                 "Run: iphone-photos api-key set")
+        else:
+            library_bytes = collect_authenticated(api, status, notes)
+    elif status["docker"]["containers"] is not None:
+        postgres = [c for c in status["docker"]["containers"] if "postgres" in c["name"] or c["service"] == "database"]
+        if postgres:
+            status["database"] = {"status": postgres[0]["health"] or postgres[0]["state"], "inferred": False}
+
+    media = installation.media_path
+    if media is not None:
+        storage = {"path": str(media), "exists": media.is_dir(), "mounted": None, "filesystem": None,
+                   "mountPoint": None, "totalBytes": None, "usedBytes": None, "freeBytes": None,
+                   "libraryBytes": library_bytes}
+        mount = mount_info(nearest_existing(media))
+        if mount:
+            storage.update(filesystem=mount["fstype"], mountPoint=mount["target"], mounted=True)
+            if any(str(media).startswith(parent + "/") for parent in MOUNT_PARENTS) and mount["target"] == "/":
+                storage["mounted"] = False
+                note(notes, "not-mounted", "The disk for %s is not mounted." % media)
+        if storage["exists"]:
+            try:
+                storage.update(disk_usage(media))
+            except OSError:
+                pass
+        else:
+            note(notes, "no-media-folder", "The media folder %s does not exist." % media)
+        if storage["freeBytes"] is not None and storage["freeBytes"] < LOW_FREE_BYTES:
+            note(notes, "low-space", "Storage is running low: %s free." % format_bytes(storage["freeBytes"]))
+        status["storage"] = storage
+
+    pending = (status["jobs"] or {}).get("pending", 0)
+    state, message, suggestion = derive_state(
+        installation.installed, status["docker"]["installed"], status["docker"]["daemonActive"],
+        server["portListening"], server["online"], bool(server["maintenanceMode"]), pending)
+    status.update(state=state, message=message, suggestion=suggestion)
+    return status
+
+
+def collect_authenticated(api, status, notes):
+    """Fill in everything that needs the API key. Each part degrades alone.
+
+    Returns the size of the library in bytes when the key may read it.
+    """
+    capabilities = status["capabilities"]
+    library_bytes = None
+    try:
+        stats = api.get("/server/statistics", authenticated=True)
+        status["library"] = {"photos": int(stats["photos"]), "videos": int(stats["videos"]), "scope": "server"}
+        library_bytes = int(stats["usage"])
+        capabilities["adminApi"] = capabilities["userApi"] = True
+    except ApiError as error:
+        if error.kind == "unauthorized":
+            note(notes, "key-rejected", "The API key was rejected. Create a new one and run: iphone-photos api-key set")
+            return None
+        try:
+            stats = api.get("/assets/statistics", authenticated=True)
+            status["library"] = {"photos": int(stats["images"]), "videos": int(stats["videos"]), "scope": "user"}
+            capabilities["userApi"] = True
+        except (ApiError, KeyError, TypeError, ValueError):
+            note(notes, "key-permissions", "The API key cannot read statistics (permission asset.statistics or server.statistics).")
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        status["jobs"] = summarize_queues(api.get("/queues", authenticated=True))
+    except (ApiError, AttributeError, TypeError, ValueError):
+        pass
+    try:
+        devices = summarize_sessions(api.get("/sessions", authenticated=True))
+        status["devices"] = devices
+        phones = [device for device in devices if is_iphone(device)] or devices
+        status["lastActivity"] = phones[0]["lastSeen"] if phones else None
+    except (ApiError, AttributeError, TypeError, ValueError):
+        pass
+    return library_bytes
+
+
+def backup_status(installation=None):
+    """What can be said about backups today. Configuring one is not built yet."""
+    installation = installation or find_installation()
+    config = load_config()
+    result = {"media": {"configured": False, "target": config.get("backupTarget")},
+              "database": {"configured": False, "count": 0, "latest": None, "location": None},
+              "lastVerified": None, "notes": []}
+    media = installation.media_path
+    if media is not None:
+        dumps_dir = media / "backups"
+        result["database"]["location"] = str(dumps_dir)
+        try:
+            dumps = sorted((entry for entry in dumps_dir.iterdir() if entry.name.endswith((".sql.gz", ".sql"))),
+                           key=lambda entry: entry.stat().st_mtime)
+        except OSError:
+            dumps = []
+        if dumps:
+            latest = datetime.fromtimestamp(dumps[-1].stat().st_mtime, timezone.utc)
+            result["database"].update(configured=True, count=len(dumps), latest=latest.isoformat())
+    result["notes"].append(
+        "Immich's database dumps are stored on the same disk as the photos. "
+        "They do not replace a backup of the photos and videos.")
+    if not result["media"]["target"]:
+        result["notes"].append("No backup target for photos and videos is configured.")
+    return result
+
+
+# --------------------------------------------------------------------------
+# Docker control
+# --------------------------------------------------------------------------
+
+def elevation():
+    """sudo asks in the terminal; without a terminal only polkit can ask."""
+    return "sudo" if sys.stdin.isatty() and shutil.which("sudo") else "pkexec"
+
+
+def compose_command(installation, *arguments):
+    """Fixed-shape compose invocation, elevated when access is not direct."""
+    command = ["docker", "compose", "--project-directory", str(installation.compose_dir), *arguments]
+    if not docker_direct():
+        command = [elevation(), *command]
+    return command
+
+
+def run_compose(installation, *arguments):
+    if not docker_installed():
+        fail("Docker is not installed.", "omarchy pkg add docker docker-compose")
+    if not installation.installed:
+        fail("Immich is not installed.", "Run scripts/install.sh")
+    if not docker_direct():
+        print("Docker needs administrator rights; you will be asked for your password.", file=sys.stderr)
+    try:
+        return subprocess.call(compose_command(installation, *arguments))
+    except FileNotFoundError as error:
+        fail("%s is not available." % error.filename)
+    except KeyboardInterrupt:
+        return 130
+
+
+def wait_until_online(installation, seconds=120):
+    api = ImmichApi("http://127.0.0.1:%d" % installation.port)
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            if api.ping():
+                return True
+        except ApiError:
+            pass
+        time.sleep(2)
+    return False
+
+
+# --------------------------------------------------------------------------
+# Setup
+# --------------------------------------------------------------------------
+
+def system_timezone():
+    code, out, _ = run(["timedatectl", "show", "-p", "Timezone", "--value"])
+    if code == 0 and out:
+        return out
+    try:
+        return os.readlink("/etc/localtime").split("zoneinfo/")[1]
+    except (OSError, IndexError):
+        return None
+
+
+def generate_password(length=40):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def render_env(template, values):
+    """Fill the official example.env. Only variables the template knows are set."""
+    lines, applied = [], set()
+    for line in template.splitlines():
+        match = re.match(r"^(#\s*)?([A-Z_]+)=", line)
+        if match and match.group(2) in values and match.group(2) not in applied:
+            line = "%s=%s" % (match.group(2), values[match.group(2)])
+            applied.add(match.group(2))
+        lines.append(line)
+    return "\n".join(lines) + "\n", applied
+
+
+def verify_release_file(name, data):
+    """Refuse a release file whose content is not the one this plugin was reviewed with."""
+    if hashlib.sha256(data).hexdigest() != RELEASE_SHA256.get(name):
+        fail("%s from Immich %s does not match the expected checksum. Nothing was installed."
+             % (name, IMMICH_RELEASE))
+    return data.decode()
+
+
+def download(name):
+    request = urllib.request.Request(RELEASE_URL + name, headers={"User-Agent": APP})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return verify_release_file(name, response.read())
+
+
+def setup(media, database=None, compose_dir=None, fetch=download):
+    """Prepare the official Immich compose project. Does not start anything."""
+    existing = find_installation()
+    if existing.installed:
+        fail("Immich is already installed in %s. Nothing was changed." % existing.compose_dir,
+             "iphone-photos integrate %s" % existing.compose_dir, code=3)
+    if port_listening(CONTAINER_PORT):
+        fail("Port %d is already in use by another program. Nothing was changed." % CONTAINER_PORT,
+             "Find it with: ss -ltnp | grep %d" % CONTAINER_PORT, code=3)
+
+    compose_dir = Path(compose_dir) if compose_dir else default_compose_dir()
+    database = Path(database).expanduser() if database else data_dir() / "postgres"
+    if (compose_dir / ".env").exists():
+        fail("%s already exists and will not be replaced." % (compose_dir / ".env"), code=3)
+
+    media_check = check_storage(media, "media")
+    db_check = check_storage(database, "database")
+    for check in (media_check, db_check):
+        for warning in check["warnings"]:
+            print("Warning (%s): %s" % (check["purpose"], warning), file=sys.stderr)
+        if not check["ok"]:
+            fail("The %s location %s is not usable:\n  %s" % (check["purpose"], check["path"],
+                                                               "\n  ".join(check["errors"])), code=2)
+    if db_check["exists"] and not db_check["empty"]:
+        fail("The database folder %s is not empty and will not be reused." % database, code=3)
+
+    compose = fetch("docker-compose.yml")
+    template = fetch("example.env")
+    if "immich-server" not in compose or "UPLOAD_LOCATION" not in template:
+        fail("The files downloaded from the Immich release look wrong. Nothing was installed.")
+
+    values = {"UPLOAD_LOCATION": media_check["path"], "DB_DATA_LOCATION": db_check["path"],
+              "DB_PASSWORD": generate_password()}
+    zone = system_timezone()
+    if zone:
+        values["TZ"] = zone
+    env_text, applied = render_env(template, values)
+    for required in ("UPLOAD_LOCATION", "DB_DATA_LOCATION", "DB_PASSWORD"):
+        if required not in applied:
+            fail("This Immich release no longer uses %s. The installer needs an update." % required)
+
+    data_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    compose_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    Path(database).mkdir(parents=True, exist_ok=True, mode=0o700)
+    Path(media_check["path"]).mkdir(parents=True, exist_ok=True)
+    if db_check["filesystem"] == "btrfs":
+        # Copy-on-write fragments database files; must be set while empty.
+        run(["chattr", "+C", str(database)])
+    write_private(compose_dir / "docker-compose.yml", compose)
+    write_private(compose_dir / ".env", env_text)
+
+    config = load_config()
+    config["composeDir"] = str(compose_dir)
+    save_config(config)
+    print("Immich is prepared in %s" % compose_dir)
+    print("  Photos and videos: %s" % media_check["path"])
+    print("  Database:          %s" % db_check["path"])
+    return 0
+
+
+def integrate(compose_dir):
+    installation = Installation(Path(compose_dir).expanduser().resolve())
+    if not installation.installed:
+        fail("No Immich compose file found in %s." % installation.compose_dir)
+    config = load_config()
+    config["composeDir"] = str(installation.compose_dir)
+    save_config(config)
+    print("Using the existing Immich installation in %s" % installation.compose_dir)
+    print("  Photos and videos: %s" % (installation.media_path or "unknown"))
+    print("  Port:              %d" % installation.port)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+def format_bytes(value):
+    if value is None:
+        return "unknown"
+    value = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024:
+            break
+        value /= 1024
+    else:
+        unit = "TB"
+    return "%d %s" % (value, unit) if unit == "B" or value >= 100 else "%.1f %s" % (value, unit)
+
+
+def fail(message, suggestion=None, code=1):
+    print(message, file=sys.stderr)
+    if suggestion:
+        print("\nSuggested action:\n%s" % suggestion, file=sys.stderr)
+    sys.exit(code)
+
+
+def section(title, rows):
+    print(title)
+    width = max(len(label) for label, _ in rows) + 1
+    for label, value in rows:
+        print("  %-*s %s" % (width, label + ":", value))
+    print()
+
+
+def print_status(status):
+    server, storage = status["server"], status["storage"]
+    labels = {"online": "Online", "busy": "Online, processing", "stopped": "Stopped", "problem": "Problem",
+              "not-installed": "Not installed", "no-docker": "Docker missing"}
+    section("Immich Server", [
+        ("Status", labels[status["state"]]),
+        ("Version", server["version"] or "unknown"),
+        ("Address", server["url"] or "no LAN address (%s works on this PC only)" % server["localUrl"]),
+    ])
+    if status["library"]:
+        scope = "whole server" if status["library"]["scope"] == "server" else "your account"
+        section("Library (%s)" % scope, [("Photos", status["library"]["photos"]),
+                                         ("Videos", status["library"]["videos"])])
+    if status["jobs"]:
+        section("Jobs", [("Pending", status["jobs"]["pending"]), ("Failed", status["jobs"]["failed"])])
+    if storage:
+        rows = [("Path", storage["path"])]
+        if storage["libraryBytes"] is not None:
+            rows.append(("Library", format_bytes(storage["libraryBytes"])))
+        rows += [("Used", format_bytes(storage["usedBytes"])), ("Free", format_bytes(storage["freeBytes"]))]
+        section("Storage", rows)
+    section("Docker", [("Status", "Running" if status["docker"]["daemonActive"] else "Not running")])
+    database = status["database"]["status"]
+    section("Database", [("Status", "Healthy (server is answering)" if database == "reachable" else database)])
+    if status["lastActivity"]:
+        section("iPhone", [("Last seen", status["lastActivity"] + " (accurate to about an hour)")])
+    for entry in status["notes"]:
+        print("Note: %s" % entry["text"])
+    if status["state"] not in ("online", "busy"):
+        print(status["message"])
+        if status["suggestion"]:
+            print("\nSuggested action:\n%s" % status["suggestion"])
+
+
+def print_storage_check(check):
+    section("Storage check", [
+        ("Path", check["path"]),
+        ("Exists", "yes" if check["exists"] else "no (will be created)"),
+        ("Mounted", ("yes, %s on %s" % (check["device"], check["mountPoint"])) if check["mounted"] else "no"),
+        ("Filesystem", check["filesystem"] or "unknown"),
+        ("Writable", "yes" if check["writable"] else "no"),
+        ("Free", format_bytes(check["freeBytes"])),
+        ("Result", "suitable" if check["ok"] else "NOT suitable"),
+    ])
+    for error in check["errors"]:
+        print("Error: %s" % error)
+    for warning in check["warnings"]:
+        print("Warning: %s" % warning)
+
+
+def print_diagnostics(status, installation):
+    code, omarchy, _ = run(["omarchy", "version"])
+    section("Omarchy", [("Version", omarchy if code == 0 and omarchy else "unknown")])
+    docker = status["docker"]
+    section("Docker", [
+        ("Engine", engine_version() or "not installed"),
+        ("Compose", compose_version() or "not installed"),
+        ("Running", "yes" if docker["daemonActive"] else "no"),
+        ("Starts at boot", "yes" if docker["enabledAtBoot"] else "no"),
+        ("Access", "direct (docker group)" if docker["direct"] else "through password prompt (pkexec)"),
+    ])
+    server = status["server"]
+    section("Immich", [
+        ("Installed", "yes, %s" % status["composeDir"] if status["installed"] else "no"),
+        ("Online", "yes" if server["online"] else "no"),
+        ("Version", server["version"] or "unknown"),
+        ("URL", server["url"] or server["localUrl"]),
+        ("Admin account", {True: "created", False: "not created yet", None: "unknown"}[server["initialized"]]),
+        ("API key", "configured" if status["capabilities"]["apiKey"] else "not configured"),
+    ])
+    storage = status["storage"]
+    if storage:
+        section("Storage", [
+            ("Path", storage["path"]),
+            ("Filesystem", storage["filesystem"] or "unknown"),
+            ("Mounted", {True: "yes", False: "NO", None: "unknown"}[storage["mounted"]]),
+            ("Free", format_bytes(storage["freeBytes"])),
+            ("Database path", str(installation.db_path) if installation.db_path else "unknown"),
+        ])
+    section("Network", [
+        ("LAN IP", server["lanIp"] or "none found"),
+        ("Port %d" % server["port"], "listening" if server["portListening"] else "closed"),
+    ])
+    database = status["database"]
+    section("Database", [("Status", "healthy (inferred: server is answering)"
+                          if database["status"] == "reachable" else database["status"])])
+    if docker["containers"]:
+        section("Containers", [(c["name"], " ".join(filter(None, [c["state"], c["health"]])))
+                               for c in docker["containers"]])
+    elif status["installed"]:
+        print("Container details need Docker access: iphone-photos server status\n")
+    for entry in status["notes"]:
+        print("Note: %s" % entry["text"])
+    if status["state"] not in ("online", "busy"):
+        print(status["message"])
+        if status["suggestion"]:
+            print("\nSuggested action:\n%s" % status["suggestion"])
+
+
+def write_qr(url, path):
+    """QR code that contains the server address and nothing else."""
+    if not shutil.which("qrencode"):
+        fail("qrencode is not installed.", "omarchy pkg add qrencode")
+    Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    code, _, err = run(["qrencode", "-o", str(path), "-s", "8", "-m", "2", "-l", "M", url])
+    if code != 0:
+        fail("Could not create the QR code: %s" % err)
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="iphone-photos", description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    status = commands.add_parser("status", help="overall status")
+    status.add_argument("--json", action="store_true")
+
+    server = commands.add_parser("server", help="control the Immich containers")
+    server.add_argument("action", choices=["status", "start", "stop", "restart", "logs"])
+    server.add_argument("--tail", type=int, default=100)
+
+    storage = commands.add_parser("storage", help="storage status and path checks")
+    storage.add_argument("action", choices=["status", "check"])
+    storage.add_argument("path", nargs="?")
+    storage.add_argument("--database", action="store_true", help="check as a database location")
+    storage.add_argument("--json", action="store_true")
+
+    backup = commands.add_parser("backup", help="backup status")
+    backup.add_argument("action", choices=["status"])
+    backup.add_argument("--json", action="store_true")
+
+    address = commands.add_parser("address", help="server address for the iPhone")
+    address.add_argument("--qr", action="store_true", help="show a QR code in the terminal")
+    address.add_argument("--qr-file", metavar="PNG", help="write the QR code to a PNG file")
+
+    api_key = commands.add_parser("api-key", help="store the Immich API key")
+    api_key.add_argument("action", choices=["set", "clear", "status"])
+
+    open_parser = commands.add_parser("open", help="open the Immich gallery in its own window")
+    open_parser.add_argument("--browser", action="store_true", help="open a normal browser tab instead")
+    commands.add_parser("diagnostics", help="full report without secrets")
+
+    setup_parser = commands.add_parser("setup", help="prepare a new Immich installation")
+    setup_parser.add_argument("--media", required=True)
+    setup_parser.add_argument("--database")
+
+    integrate_parser = commands.add_parser("integrate", help="use an existing Immich installation")
+    integrate_parser.add_argument("compose_dir")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    command = args.command
+
+    if command == "setup":
+        return setup(args.media, args.database)
+    if command == "integrate":
+        return integrate(args.compose_dir)
+
+    installation = find_installation()
+
+    if command == "status":
+        status = collect_status(installation)
+        if args.json:
+            print(json.dumps(status))
+        else:
+            print_status(status)
+        return 0
+
+    if command == "diagnostics":
+        print_diagnostics(collect_status(installation), installation)
+        return 0
+
+    if command == "server":
+        if args.action == "status":
+            return run_compose(installation, "ps", "-a")
+        if args.action == "logs":
+            return run_compose(installation, "logs", "--no-color", "--tail", str(max(1, args.tail)))
+        if args.action == "stop":
+            return run_compose(installation, "stop")
+        code = run_compose(installation, *(("up", "-d") if args.action == "start" else ("restart",)))
+        if code != 0:
+            fail("Docker could not %s Immich (exit code %d)." % (args.action, code), "iphone-photos server logs")
+        print("Waiting for Immich to answer…")
+        if not wait_until_online(installation):
+            fail("The containers were started but Immich is not answering yet.", "iphone-photos server logs")
+        print("Immich is online at http://localhost:%d" % installation.port)
+        return 0
+
+    if command == "storage":
+        if args.action == "check":
+            if not args.path:
+                fail("Give the path to check, for example: iphone-photos storage check ~/Pictures/Immich")
+            check = check_storage(args.path, "database" if args.database else "media")
+            if args.json:
+                print(json.dumps(check))
+            else:
+                print_storage_check(check)
+            return 0 if check["ok"] else 2
+        media = installation.media_path
+        if media is None:
+            fail("Immich is not installed, so there is no storage location yet.", "Run scripts/install.sh")
+        check = check_storage(media, "media")
+        if args.json:
+            print(json.dumps(check))
+        else:
+            print_storage_check(check)
+        return 0 if check["ok"] else 2
+
+    if command == "backup":
+        result = backup_status(installation)
+        if args.json:
+            print(json.dumps(result))
+            return 0
+        database = result["database"]
+        section("Backup", [
+            ("Media backup", "configured: %s" % result["media"]["target"] if result["media"]["configured"]
+             else "not configured"),
+            ("Database dumps", "%d, newest %s" % (database["count"], database["latest"])
+             if database["configured"] else "none yet (Immich creates them nightly)"),
+            ("Last verified", result["lastVerified"] or "never"),
+        ])
+        for note in result["notes"]:
+            print("Note: %s" % note)
+        return 0
+
+    if command == "address":
+        address = lan_ip()
+        if not address:
+            fail("This PC has no local network address. Connect to your Wi-Fi or LAN first.")
+        url = "http://%s:%d" % (address, installation.port)
+        if args.qr_file:
+            write_qr(url, args.qr_file)
+        print(url)
+        if args.qr:
+            subprocess.call(["qrencode", "-t", "ANSIUTF8", "-m", "2", url])
+        return 0
+
+    if command == "api-key":
+        path = config_dir() / "api-key"
+        if args.action == "status":
+            print("configured" if read_api_key() else "not configured")
+            return 0
+        if args.action == "clear":
+            path.unlink(missing_ok=True)
+            print("API key removed.")
+            return 0
+        key = (getpass.getpass("Immich API key: ") if sys.stdin.isatty() else sys.stdin.readline()).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{20,200}", key):
+            fail("That does not look like an Immich API key. Nothing was saved.")
+        try:
+            ImmichApi("http://127.0.0.1:%d" % installation.port, key).get("/api-keys/me", authenticated=True)
+        except ApiError as error:
+            if error.kind in ("unauthorized", "forbidden"):
+                fail("Immich rejected this key. Nothing was saved.")
+            print("Immich is not reachable right now; the key is saved unchecked.", file=sys.stderr)
+        config_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_private(path, key + "\n")
+        print("API key saved.")
+        return 0
+
+    if command == "open":
+        url = "http://localhost:%d" % installation.port
+        # Omarchy's web app launcher gives the gallery its own window without
+        # browser chrome; a plain browser tab is the fallback.
+        launcher = None if args.browser else shutil.which("omarchy-launch-webapp")
+        subprocess.Popen([launcher, url] if launcher else ["xdg-open", url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

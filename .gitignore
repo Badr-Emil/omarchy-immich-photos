@@ -1,0 +1,12 @@
+.env
+*.secret
+*.token
+credentials/
+api-key
+__pycache__/
+*.pyc
+*.swp
+*.tmp
+
+# Analysis of the machine this was developed on; not part of the plugin
+docs/feasibility.md

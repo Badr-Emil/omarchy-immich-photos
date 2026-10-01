@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.badr-emil.iphone-photos",
+  "name": "iPhone Photos",
+  "version": "0.1.0",
+  "author": "Badr-Emil",
+  "license": "MIT",
+  "description": "Back up iPhone photos and videos to this PC over Wi-Fi with a local Immich server: install, monitor and control it from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "iPhone Photos",
+    "description": "Status of the local Immich server, photo and video counts, storage, the server address and QR code for the iPhone, and start/stop controls.",
+    "category": "Network",
+    "aliases": [
+      "iphone",
+      "photos",
+      "immich",
+      "backup"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15,
+      "showCount": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "showCount",
+        "type": "boolean",
+        "label": "Show the number of jobs Immich is still processing",
+        "defaultValue": true
+      }
+    ]
+  }
+}
