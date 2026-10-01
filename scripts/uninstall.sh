@@ -83,6 +83,8 @@ fi
 if ask "Remove the plugin configuration and the stored API key?" n; then
   rm -f "$CONFIG_DIR/api-key" "$CONFIG_DIR/config.json" "$CONFIG_DIR/enabled-docker-at-boot"
   rmdir "$CONFIG_DIR" 2>/dev/null || true
+  # Thumbnails and previews the photo browser downloaded; nothing else lives there.
+  rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-iphone-photos"
   echo "Configuration removed."
   if $containers_removed; then
     echo

@@ -1053,7 +1053,8 @@ Panel {
 
           Hint {
             text: "In Immich: Account Settings → API Keys → New API Key. Required permissions: "
-              + "asset.statistics, server.statistics, queue.read, session.read. "
+              + "asset.statistics, server.statistics, queue.read, session.read; for the photo browser also "
+              + "asset.read, asset.view, asset.update, asset.delete, album.read, album.create, albumAsset.create. "
               + "The key is stored only in ~/.config/omarchy-iphone-photos/api-key (readable by you alone)."
           }
         }

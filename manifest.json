@@ -5,12 +5,14 @@
   "version": "0.1.0",
   "author": "Badr-Emil",
   "license": "MIT",
-  "description": "Back up iPhone photos and videos to this PC over Wi-Fi with a local Immich server: install, monitor and control it from the Omarchy bar.",
+  "description": "Back up iPhone photos and videos to this PC over Wi-Fi with a local Immich server: install, monitor and control it from the Omarchy bar, and browse the photos with the keyboard.",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "overlay"
   ],
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "Panel.qml",
+    "overlay": "Gallery.qml"
   },
   "barWidget": {
     "displayName": "iPhone Photos",

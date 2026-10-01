@@ -29,6 +29,8 @@ actually report; what cannot be determined is left out rather than estimated.
 - Panel with photo and video counts, disk usage, when the iPhone was last
   seen, the server address with QR code, and storage and backup pages
 - Start, stop, restart, logs and diagnostics
+- Keyboard-driven photo browser overlay: view, mark, trash, restore, albums,
+  favorites, archive
 - Gallery in its own app window, with an "iPhone Photos" launcher entry
 - `iphone-photos` command line tool with JSON output
 
@@ -86,6 +88,41 @@ administrator. For photo and job counts in the panel, create an API key
 (Account Settings → API Keys, permissions `asset.statistics`,
 `server.statistics`, `queue.read`, `session.read`) and paste it under
 Settings in the panel, or run `iphone-photos api-key set`.
+
+## Photo browser
+
+A full-screen browser for the photos on the server, operated entirely from the
+keyboard. Open it with
+
+```bash
+omarchy-shell shell toggle io.github.badr-emil.iphone-photos
+```
+
+or bind that command to a key in `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + ALT + P", "iPhone Photos", "omarchy-shell shell toggle io.github.badr-emil.iphone-photos")
+```
+
+| Key | Action |
+|---|---|
+| arrows or `h j k l`, `PgUp` `PgDn`, `g` `G` | move |
+| `Enter` | open the photo large, play a video in `mpv` |
+| `Space` | mark several photos for the next action |
+| `d` | move to the Immich trash (asks first; nothing is deleted permanently) |
+| `u` | restore what was just trashed |
+| `m` | add to an album, `n` in the list creates a new one |
+| `f` | favorite on or off |
+| `a` | archive |
+| `o` | open the Immich web gallery |
+| `r` | reload |
+| `Esc` or `q` | back, clear marks, close |
+
+The browser needs an API key with these permissions in addition to the four
+above: `asset.read`, `asset.view`, `asset.update`, `asset.delete`,
+`album.read`, `album.create`, `albumAsset.create`. Thumbnails and previews are
+cached in `~/.cache/omarchy-iphone-photos/` (readable by you alone); the
+uninstaller removes that folder with the configuration.
 
 ## Set up the iPhone
 

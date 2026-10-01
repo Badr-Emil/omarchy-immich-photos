@@ -16,7 +16,7 @@ if [[ -x $qmllint && -d ${OMARCHY_PATH:-/usr/share/omarchy}/shell ]]; then
   trap 'rm -rf "$imports"' EXIT
   ln -s "${OMARCHY_PATH:-/usr/share/omarchy}/shell" "$imports/qs"
   # Dynamic typing of the bar object produces warnings; import and syntax errors must not occur.
-  if "$qmllint" -I "$imports" Panel.qml 2>&1 | grep -E '\[(import|syntax)\]|not found\. Did you add'; then
+  if "$qmllint" -I "$imports" Panel.qml Gallery.qml 2>&1 | grep -E '\[(import|syntax)\]|not found\. Did you add'; then
     echo "qmllint found import or syntax problems" >&2
     exit 1
   fi

@@ -339,6 +339,7 @@ class NetworkAddress(unittest.TestCase):
 
 class FakeImmich(BaseHTTPRequestHandler):
     routes = {}
+    writes = []
 
     def do_GET(self):
         status, body, needs_key = self.routes.get(self.path, (404, {"message": "Not found"}, False))
@@ -350,6 +351,23 @@ class FakeImmich(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def respond_to_write(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length) or b"null")
+        FakeImmich.writes.append((self.command, self.path, body))
+        key = "%s %s" % (self.command, self.path)
+        status, answer, needs_key = self.routes.get(key, (404, {"message": "Not found"}, False))
+        if needs_key and self.headers.get("x-api-key") != "valid-key":
+            status, answer = 401, {"message": "Invalid API key"}
+        payload = b"" if answer is None else json.dumps(answer).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_POST = do_PUT = do_DELETE = respond_to_write
 
     def log_message(self, *args):
         pass
@@ -371,6 +389,7 @@ class WithFakeImmich(IsolatedHome):
     def setUp(self):
         super().setUp()
         FakeImmich.routes = dict(self.ROUTES)
+        FakeImmich.writes = []
         self.server = HTTPServer(("127.0.0.1", 0), FakeImmich)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -668,6 +687,142 @@ class BackupStatus(IsolatedHome):
         self.assertTrue(result["database"]["configured"])
         self.assertEqual(result["database"]["count"], 1)
         self.assertFalse(result["media"]["configured"])
+
+
+PHOTO = "11111111-1111-4111-8111-111111111111"
+VIDEO = "22222222-2222-4222-8222-222222222222"
+ALBUM = "33333333-3333-4333-8333-333333333333"
+
+
+class Gallery(WithFakeImmich):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.home / ".cache")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.set_key("valid-key")
+        FakeImmich.routes.update({
+            "POST /api/search/metadata": (200, {"assets": {"total": 2, "nextPage": None, "items": [
+                {"id": PHOTO, "type": "IMAGE", "originalFileName": "IMG_1.HEIC", "isFavorite": True,
+                 "localDateTime": "2026-10-01T10:00:00.000Z"},
+                {"id": VIDEO, "type": "VIDEO", "originalFileName": "IMG_2.MOV", "isFavorite": False,
+                 "localDateTime": "2026-09-30T10:00:00.000Z", "duration": "00:00:07.000"},
+                {"id": "../../etc/passwd", "type": "IMAGE"},
+            ]}}, True),
+            "/api/assets/%s/thumbnail?size=thumbnail" % PHOTO: (200, b"thumb-1", True),
+            "/api/assets/%s/thumbnail?size=thumbnail" % VIDEO: (200, b"thumb-2", True),
+            "/api/assets/%s/thumbnail?size=preview" % PHOTO: (200, b"preview-1", True),
+            "DELETE /api/assets": (204, None, True),
+            "PUT /api/assets": (204, None, True),
+            "POST /api/trash/restore/assets": (200, {"count": 1}, True),
+            "/api/albums": (200, [{"id": ALBUM, "albumName": "Urlaub", "assetCount": 3},
+                                  {"id": PHOTO, "albumName": "alpen", "assetCount": 1}], True),
+            "PUT /api/albums/%s/assets" % ALBUM: (200, [{"id": PHOTO, "success": True}], True),
+            "POST /api/albums": (201, {"id": ALBUM, "albumName": "Neu"}, True),
+        })
+
+    def gallery(self, action, *arguments):
+        return ip.gallery_command(self.installation(), action, list(arguments))
+
+    def error(self, action, *arguments):
+        with self.assertRaises(ip.GalleryError) as caught:
+            self.gallery(action, *arguments)
+        return caught.exception
+
+    def test_list_returns_items_with_cached_thumbnails(self):
+        result = self.gallery("list")
+        self.assertEqual([item["id"] for item in result["items"]], [PHOTO, VIDEO])
+        self.assertEqual(result["items"][0]["type"], "image")
+        self.assertTrue(result["items"][0]["favorite"])
+        self.assertEqual(result["items"][1]["type"], "video")
+        self.assertEqual(Path(result["items"][0]["thumb"]).read_bytes(), b"thumb-1")
+        self.assertIsNone(result["nextPage"])
+        self.assertEqual(result["items"][1]["duration"], "0:07")
+        self.assertEqual(FakeImmich.writes[0][2],
+                         {"page": 1, "size": 150, "order": "desc", "visibility": "timeline"})
+
+    def test_duration_formats(self):
+        self.assertEqual(ip.format_duration(1900), "0:02")
+        self.assertEqual(ip.format_duration(125000), "2:05")
+        self.assertEqual(ip.format_duration("01:02:03.500"), "1:02:04")
+        self.assertIsNone(ip.format_duration(None))
+        self.assertIsNone(ip.format_duration("soon"))
+
+    def test_ids_that_are_not_uuids_never_reach_a_path_or_url(self):
+        self.gallery("list")
+        self.assertFalse(any("passwd" in str(path) for path in ip.cache_dir().rglob("*")))
+        self.assertEqual(self.error("preview", "../../etc/passwd").kind, "usage")
+        self.assertEqual(self.error("trash", "abc; rm -rf").kind, "usage")
+        self.assertEqual(FakeImmich.writes[1:], [])
+
+    def test_cache_is_private_and_reused(self):
+        first = self.gallery("preview", PHOTO)["previews"][PHOTO]
+        self.assertEqual(stat.S_IMODE(os.stat(first).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(Path(first).parent).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(ip.cache_dir()).st_mode), 0o700)
+        del FakeImmich.routes["/api/assets/%s/thumbnail?size=preview" % PHOTO]
+        self.assertEqual(self.gallery("preview", PHOTO)["previews"][PHOTO], first)
+
+    def test_old_previews_are_pruned(self):
+        folder = ip.cache_dir() / "previews"
+        folder.mkdir(parents=True)
+        for number in range(5):
+            (folder / ("%d.img" % number)).write_text("x")
+            os.utime(folder / ("%d.img" % number), (number, number))
+        ip.prune_previews(limit=2)
+        self.assertEqual(sorted(entry.name for entry in folder.iterdir()), ["3.img", "4.img"])
+
+    def test_trash_never_deletes_permanently(self):
+        self.assertEqual(self.gallery("trash", PHOTO, VIDEO), {"trashed": [PHOTO, VIDEO]})
+        self.assertEqual(FakeImmich.writes, [("DELETE", "/api/assets", {"ids": [PHOTO, VIDEO], "force": False})])
+
+    def test_restore_from_trash(self):
+        self.gallery("restore", PHOTO)
+        self.assertEqual(FakeImmich.writes, [("POST", "/api/trash/restore/assets", {"ids": [PHOTO]})])
+
+    def test_favorite_and_archive(self):
+        self.gallery("favorite", "on", PHOTO)
+        self.gallery("archive", "on", PHOTO)
+        self.gallery("archive", "off", PHOTO)
+        self.assertEqual([write[2] for write in FakeImmich.writes], [
+            {"isFavorite": True, "ids": [PHOTO]},
+            {"visibility": "archive", "ids": [PHOTO]},
+            {"visibility": "timeline", "ids": [PHOTO]},
+        ])
+        self.assertEqual(self.error("favorite", "maybe", PHOTO).kind, "usage")
+
+    def test_albums_sorted_by_name(self):
+        self.assertEqual([album["name"] for album in self.gallery("albums")["albums"]], ["alpen", "Urlaub"])
+
+    def test_add_to_album_and_create_album(self):
+        self.gallery("album-add", ALBUM, PHOTO, VIDEO)
+        self.gallery("album-create", "Neu", PHOTO)
+        self.assertEqual(FakeImmich.writes, [
+            ("PUT", "/api/albums/%s/assets" % ALBUM, {"ids": [PHOTO, VIDEO]}),
+            ("POST", "/api/albums", {"albumName": "Neu", "assetIds": [PHOTO]}),
+        ])
+        self.assertEqual(self.error("album-add", ALBUM).kind, "usage")
+        self.assertEqual(self.error("album-create", " ", PHOTO).kind, "usage")
+
+    def test_missing_permission_names_what_the_key_needs(self):
+        FakeImmich.routes["POST /api/search/metadata"] = (403, {"message": "Forbidden"}, False)
+        error = self.error("list")
+        self.assertEqual(error.kind, "permissions")
+        self.assertIn("asset.delete", str(error))
+
+    def test_no_key(self):
+        (ip.config_dir() / "api-key").unlink()
+        self.assertEqual(self.error("list").kind, "no-key")
+
+    def test_original_must_lie_inside_the_media_folder(self):
+        installation = self.installation()
+        media = installation.media_path
+        (media / "upload").mkdir()
+        (media / "upload/clip.mov").write_text("x")
+        self.assertEqual(ip.local_original(installation, "/data/upload/clip.mov"), media / "upload/clip.mov")
+        self.assertIsNone(ip.local_original(installation, "/data/../../etc/passwd"))
+        self.assertIsNone(ip.local_original(installation, "/etc/passwd"))
+        self.assertIsNone(ip.local_original(installation, "/data/upload/missing.mov"))
 
 
 if __name__ == "__main__":

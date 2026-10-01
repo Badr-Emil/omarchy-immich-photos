@@ -115,6 +115,29 @@ omarchy-shell io.github.badr-emil.iphone-photos toggle
 omarchy-shell io.github.badr-emil.iphone-photos.page go setup   # storage, backup, settings
 ```
 
+## Photo browser
+
+`Gallery.qml` is the plugin's second entry point, an `overlay` that
+`omarchy-shell shell toggle io.github.badr-emil.iphone-photos` opens as a
+full-screen layer with exclusive keyboard focus, like Omarchy's own image
+picker. It follows the same rule as the panel: QML shows, the backend talks.
+
+| Backend command | Immich API |
+|---|---|
+| `gallery list <page>` | `POST /search/metadata`, thumbnails from `GET /assets/{id}/thumbnail` |
+| `gallery preview <id>…` | `GET /assets/{id}/thumbnail?size=preview` |
+| `gallery trash <id>…` | `DELETE /assets` with `force: false` |
+| `gallery restore <id>…` | `POST /trash/restore/assets` |
+| `gallery favorite\|archive on\|off <id>…` | `PUT /assets` |
+| `gallery albums`, `album-add`, `album-create` | `GET /albums`, `PUT /albums/{id}/assets`, `POST /albums` |
+| `gallery play <id>` | `GET /assets/{id}`, then the original file from `UPLOAD_LOCATION` |
+
+Images reach QML as files in `~/.cache/omarchy-iphone-photos/` (directory 700,
+files 600), so the API key never appears in a URL or in QML. Ids are accepted
+only if they are UUIDs, because they become part of URLs and file names.
+Deleting always means Immich's trash; the backend has no code path for
+permanent deletion or for emptying the trash.
+
 ## Privileges
 
 Docker actions that change something go through one function that first

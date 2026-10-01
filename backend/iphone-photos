@@ -25,6 +25,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -490,29 +491,44 @@ class ImmichApi:
         self.timeout = timeout
 
     def get(self, path, authenticated=False):
-        request = urllib.request.Request(self.base_url + "/api" + path, headers={"Accept": "application/json"})
+        return self.request("GET", path, authenticated=authenticated)
+
+    def request(self, method, path, body=None, authenticated=True, raw=False, timeout=None):
+        """One API call. Returns parsed JSON, or the raw bytes when `raw` is set."""
+        timeout = timeout or self.timeout
+        headers = {"Accept": "application/octet-stream" if raw else "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(self.base_url + "/api" + path, data=data, headers=headers, method=method)
         if authenticated:
             if not self.api_key:
                 raise ApiError("no-key", "No API key configured.")
             request.add_header("x-api-key", self.api_key)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read()
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = response.read()
         except urllib.error.HTTPError as error:
+            error.close()
             if error.code == 401:
                 raise ApiError("unauthorized", "The API key was rejected.", 401)
             if error.code == 403:
                 raise ApiError("forbidden", "The API key lacks the permission for %s." % path, 403)
             raise ApiError("http", "Immich answered %s with HTTP %d." % (path, error.code), error.code)
         except (TimeoutError, socket.timeout):
-            raise ApiError("timeout", "Immich did not answer within %d seconds." % self.timeout)
+            raise ApiError("timeout", "Immich did not answer within %d seconds." % timeout)
         except (urllib.error.URLError, OSError) as error:
             reason = getattr(error, "reason", error)
             if isinstance(reason, (TimeoutError, socket.timeout)):
-                raise ApiError("timeout", "Immich did not answer within %d seconds." % self.timeout)
+                raise ApiError("timeout", "Immich did not answer within %d seconds." % timeout)
             raise ApiError("unreachable", "Immich is not reachable at %s." % self.base_url)
+        if raw:
+            return payload
+        if not payload:
+            return None
         try:
-            return json.loads(body)
+            return json.loads(payload)
         except ValueError:
             raise ApiError("invalid", "Immich returned something that is not JSON for %s." % path)
 
@@ -752,6 +768,218 @@ def backup_status(installation=None):
     if not result["media"]["target"]:
         result["notes"].append("No backup target for photos and videos is configured.")
     return result
+
+
+# --------------------------------------------------------------------------
+# Gallery
+# --------------------------------------------------------------------------
+
+GALLERY_PERMISSIONS = ("asset.read", "asset.view", "asset.update", "asset.delete",
+                       "album.read", "album.create", "albumAsset.create")
+PREVIEW_CACHE_LIMIT = 300
+ASSET_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class GalleryError(Exception):
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
+def cache_dir():
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / APP
+
+
+def checked_ids(ids):
+    """Asset and album ids end up in URLs and file names, so only UUIDs pass."""
+    ids = list(ids)
+    if not ids:
+        raise GalleryError("usage", "No photo selected.")
+    for value in ids:
+        if not ASSET_ID.match(str(value)):
+            raise GalleryError("usage", "Not a valid Immich id: %s" % value)
+    return ids
+
+
+def gallery_api(installation):
+    key = read_api_key()
+    if not key:
+        raise GalleryError("no-key", "The gallery needs an API key. Add one under Settings in the panel.")
+    return ImmichApi("http://127.0.0.1:%d" % installation.port, key, timeout=10)
+
+
+def gallery_call(api, method, path, body=None, raw=False, timeout=None):
+    try:
+        return api.request(method, path, body, raw=raw, timeout=timeout)
+    except ApiError as error:
+        if error.kind == "forbidden":
+            raise GalleryError("permissions", "The API key lacks a permission the gallery needs. "
+                               "Create a key with: %s" % ", ".join(GALLERY_PERMISSIONS))
+        if error.kind == "unauthorized":
+            raise GalleryError("no-key", "Immich rejects the API key. Add a new one under Settings in the panel.")
+        raise GalleryError(error.kind, str(error))
+
+
+def cached_image(api, asset_id, size):
+    """Local copy of an asset's thumbnail or preview, downloaded once."""
+    folder = cache_dir() / ("thumbs" if size == "thumbnail" else "previews")
+    path = folder / (asset_id + ".img")
+    try:
+        if path.stat().st_size > 0:
+            if size != "thumbnail":
+                os.utime(path)
+            return path
+    except OSError:
+        pass
+    data = gallery_call(api, "GET", "/assets/%s/thumbnail?size=%s" % (asset_id, size), raw=True, timeout=20)
+    for directory in (cache_dir(), folder):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = folder / (asset_id + ".part%d" % os.getpid())
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    os.replace(temporary, path)
+    return path
+
+
+def prune_previews(limit=PREVIEW_CACHE_LIMIT):
+    """Previews are large; keep only the most recently viewed ones."""
+    try:
+        files = sorted((cache_dir() / "previews").glob("*.img"), key=lambda entry: entry.stat().st_mtime)
+    except OSError:
+        return
+    for entry in files[:-limit] if len(files) > limit else []:
+        entry.unlink(missing_ok=True)
+
+
+def format_duration(value):
+    """Video length as m:ss. Immich reports milliseconds, older versions H:MM:SS.fff."""
+    try:
+        if isinstance(value, str):
+            hours, minutes, seconds = value.split(":")
+            total = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        else:
+            total = float(value) / 1000
+    except (TypeError, ValueError):
+        return None
+    total = int(round(total))
+    if total >= 3600:
+        return "%d:%02d:%02d" % (total // 3600, total % 3600 // 60, total % 60)
+    return "%d:%02d" % (total // 60, total % 60)
+
+
+def gallery_item(asset):
+    video = asset.get("type") == "VIDEO"
+    return {"id": asset["id"], "type": "video" if video else "image",
+            "name": asset.get("originalFileName") or "", "favorite": bool(asset.get("isFavorite")),
+            "date": asset.get("localDateTime") or asset.get("fileCreatedAt"),
+            "duration": format_duration(asset.get("duration")) if video else None, "thumb": None}
+
+
+def gallery_list(api, page=1, size=150):
+    """One page of the timeline, newest first, with thumbnails in the local cache."""
+    # "timeline" leaves out archived items and the hidden video halves of Live Photos.
+    result = gallery_call(api, "POST", "/search/metadata",
+                          {"page": page, "size": size, "order": "desc", "visibility": "timeline"})
+    assets = (result or {}).get("assets") or {}
+    items = [gallery_item(asset) for asset in assets.get("items") or [] if ASSET_ID.match(str(asset.get("id")))]
+
+    def thumbnail(item):
+        try:
+            item["thumb"] = str(cached_image(api, item["id"], "thumbnail"))
+        except (GalleryError, OSError):
+            item["thumb"] = None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(thumbnail, items))
+    next_page = assets.get("nextPage")
+    return {"items": items, "page": page, "nextPage": int(next_page) if next_page else None}
+
+
+def gallery_previews(api, ids):
+    paths = {}
+    for asset_id in checked_ids(ids):
+        paths[asset_id] = str(cached_image(api, asset_id, "preview"))
+    prune_previews()
+    return {"previews": paths}
+
+
+def gallery_albums(api):
+    albums = gallery_call(api, "GET", "/albums") or []
+    return {"albums": sorted(({"id": album["id"], "name": album.get("albumName") or "",
+                               "count": album.get("assetCount")} for album in albums),
+                             key=lambda album: album["name"].lower())}
+
+
+def local_original(installation, original_path):
+    """Path of an original on this PC. Immich reports it as seen inside the container."""
+    media = installation.media_path
+    if not media or not original_path:
+        return None
+    try:
+        relative = Path(original_path).relative_to("/data")
+    except ValueError:
+        return None
+    candidate = (media / relative).resolve()
+    if media.resolve() not in candidate.parents or not os.access(candidate, os.R_OK):
+        return None
+    return candidate
+
+
+def gallery_play(api, installation, asset_id):
+    """Open an original in the video player (or the default app for images)."""
+    asset_id = checked_ids([asset_id])[0]
+    asset = gallery_call(api, "GET", "/assets/%s" % asset_id)
+    target = local_original(installation, asset.get("originalPath"))
+    if target is None:
+        raise GalleryError("not-local", "The original file is not readable on this PC.")
+    player = shutil.which("mpv") if asset.get("type") == "VIDEO" else None
+    subprocess.Popen([player, "--no-terminal", str(target)] if player else ["xdg-open", str(target)],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    return {"opened": str(target)}
+
+
+def gallery_command(installation, action, arguments):
+    api = gallery_api(installation)
+    if action == "list":
+        page = int(arguments[0]) if arguments else 1
+        return gallery_list(api, max(1, page))
+    if action == "preview":
+        return gallery_previews(api, arguments)
+    if action == "albums":
+        return gallery_albums(api)
+    if action == "play":
+        return gallery_play(api, installation, arguments[0] if arguments else "")
+    if action == "trash":
+        # Never `force`: assets go to Immich's trash and stay restorable.
+        ids = checked_ids(arguments)
+        gallery_call(api, "DELETE", "/assets", {"ids": ids, "force": False})
+        return {"trashed": ids}
+    if action == "restore":
+        ids = checked_ids(arguments)
+        gallery_call(api, "POST", "/trash/restore/assets", {"ids": ids})
+        return {"restored": ids}
+    if action in ("favorite", "archive"):
+        if not arguments or arguments[0] not in ("on", "off"):
+            raise GalleryError("usage", "Usage: gallery %s on|off ID..." % action)
+        enabled = arguments[0] == "on"
+        ids = checked_ids(arguments[1:])
+        change = {"isFavorite": enabled} if action == "favorite" else \
+            {"visibility": "archive" if enabled else "timeline"}
+        gallery_call(api, "PUT", "/assets", dict(change, ids=ids))
+        return {action: enabled, "ids": ids}
+    if action == "album-add":
+        ids = checked_ids(arguments)
+        gallery_call(api, "PUT", "/albums/%s/assets" % ids[0], {"ids": ids[1:] or checked_ids([])})
+        return {"album": ids[0], "added": ids[1:]}
+    if action == "album-create":
+        name = (arguments[0] if arguments else "").strip()
+        if not name or len(name) > 100:
+            raise GalleryError("usage", "Give the new album a name.")
+        ids = checked_ids(arguments[1:])
+        album = gallery_call(api, "POST", "/albums", {"albumName": name, "assetIds": ids})
+        return {"album": album["id"], "name": name, "added": ids}
+    raise GalleryError("usage", "Unknown gallery action: %s" % action)
 
 
 # --------------------------------------------------------------------------
@@ -1094,6 +1322,11 @@ def build_parser():
     open_parser.add_argument("--browser", action="store_true", help="open a normal browser tab instead")
     commands.add_parser("diagnostics", help="full report without secrets")
 
+    gallery = commands.add_parser("gallery", help="photo browser data and actions (JSON)")
+    gallery.add_argument("action", choices=["list", "preview", "albums", "play", "trash", "restore",
+                                            "favorite", "archive", "album-add", "album-create"])
+    gallery.add_argument("arguments", nargs="*")
+
     setup_parser = commands.add_parser("setup", help="prepare a new Immich installation")
     setup_parser.add_argument("--media", required=True)
     setup_parser.add_argument("--database")
@@ -1125,6 +1358,14 @@ def main(argv=None):
     if command == "diagnostics":
         print_diagnostics(collect_status(installation), installation)
         return 0
+
+    if command == "gallery":
+        try:
+            print(json.dumps(gallery_command(installation, args.action, args.arguments)))
+            return 0
+        except GalleryError as error:
+            print(json.dumps({"error": {"kind": error.kind, "message": str(error)}}))
+            return 1
 
     if command == "server":
         if args.action == "status":
