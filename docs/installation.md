@@ -12,9 +12,9 @@ Nothing comes from the AUR.
 ## Steps
 
 ```bash
-omarchy plugin add https://github.com/Badr-Emil/omarchy-iphone-photos
-omarchy plugin enable io.github.badr-emil.iphone-photos
-~/.config/omarchy/plugins/io.github.badr-emil.iphone-photos/scripts/install.sh
+omarchy plugin add https://github.com/Badr-Emil/omarchy-immich-photos
+omarchy plugin enable io.github.badr-emil.immich-photos
+~/.config/omarchy/plugins/io.github.badr-emil.immich-photos/scripts/install.sh
 ```
 
 The panel's "Set up Immich" button starts the same installer in a terminal.
@@ -32,8 +32,8 @@ It explains every system change and asks before making it:
 8. starts Immich and waits until the server answers
 9. explains the firewall situation without changing any rule
 10. links the plugin, validates it, enables it in the bar
-11. adds the "iPhone Photos" launcher entry
-12. shows the address and QR code for the iPhone
+11. adds the "Immich Photos" launcher entry
+12. shows the address and QR code for the phone
 
 Without questions: `./scripts/install.sh --yes --media ~/Pictures/Immich`
 
@@ -43,7 +43,7 @@ Without questions: `./scripts/install.sh --yes --media ~/Pictures/Immich`
 |---|---|---|
 | `sudo docker ps -a` | looking for existing Immich containers | read-only |
 | `sudo systemctl enable --now docker.service` | start at boot | `sudo systemctl disable docker.service` |
-| `sudo docker compose up -d` | start Immich | `iphone-photos server stop` |
+| `sudo docker compose up -d` | start Immich | `immich-photos server stop` |
 
 The user is not added to the `docker` group. If you want that:
 `omarchy-setup-security-sudoless-docker` (equivalent to passwordless root).
@@ -52,23 +52,23 @@ The user is not added to the `docker` group. If you want that:
 
 1. Open `http://localhost:2283` and create the first account. It becomes the
    administrator.
-2. Connect the iPhone: `iphone-setup.md`
+2. Connect your phone: `phone-setup.md`
 3. For photo and job counts in the panel, add an API key: Immich → Account
    Settings → API Keys, permissions `asset.statistics`, `server.statistics`,
    `queue.read`, `session.read`. Paste it under Settings in the panel or run
-   `iphone-photos api-key set`.
+   `immich-photos api-key set`.
 
 ## Command line
 
 ```bash
-iphone-photos status            # overview, --json for scripts
-iphone-photos server start      # also stop, restart, status, logs
-iphone-photos storage status
-iphone-photos storage check /mnt/photos/Immich
-iphone-photos backup status
-iphone-photos address --qr
-iphone-photos open
-iphone-photos diagnostics
+immich-photos status            # overview, --json for scripts
+immich-photos server start      # also stop, restart, status, logs
+immich-photos storage status
+immich-photos storage check /mnt/photos/Immich
+immich-photos backup status
+immich-photos address --qr
+immich-photos open
+immich-photos diagnostics
 ```
 
 ## Removal

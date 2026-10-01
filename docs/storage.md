@@ -12,8 +12,8 @@ Thumbnails and transcoded videos add about 10–20 % to the library.
 ## The check
 
 ```bash
-iphone-photos storage check /mnt/photos/Immich
-iphone-photos storage check --database ~/.local/share/omarchy-iphone-photos/postgres
+immich-photos storage check /mnt/photos/Immich
+immich-photos storage check --database ~/.local/share/omarchy-immich-photos/postgres
 ```
 
 It creates nothing and answers these questions:
@@ -44,22 +44,22 @@ and restart Immich. Once photos exist, the plugin does not change the path.
 Moving is manual work, in this order:
 
 1. **Stop**
-   `iphone-photos server stop`
+   `immich-photos server stop`
 2. **Check the source**
    `sudo du -sh ~/Pictures/Immich`
 3. **Check the target**
-   `iphone-photos storage check /mnt/ssd/Immich`
+   `immich-photos storage check /mnt/ssd/Immich`
 4. **Back up** the source to a third disk if you have one.
 5. **Copy**, do not move. Ownership and permissions are preserved:
    `sudo rsync -aHAX --info=progress2 ~/Pictures/Immich/ /mnt/ssd/Immich/`
 6. **Verify** with checksums. The output must be empty:
    `sudo rsync -aHAX --checksum --dry-run --itemize-changes ~/Pictures/Immich/ /mnt/ssd/Immich/`
 7. **Switch**: set `UPLOAD_LOCATION=/mnt/ssd/Immich` in
-   `~/.local/share/omarchy-iphone-photos/immich/.env`.
+   `~/.local/share/omarchy-immich-photos/immich/.env`.
 8. **Start**
-   `iphone-photos server start`
+   `immich-photos server start`
 9. **Test**: open the gallery, look at old photos, upload a new one,
-   `iphone-photos storage status`.
+   `immich-photos storage status`.
 
 Delete the old copy only after everything has run for a few days, and by hand.
 No `mv`, no `rsync --delete`.

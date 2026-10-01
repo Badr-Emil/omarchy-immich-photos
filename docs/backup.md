@@ -7,7 +7,7 @@ one disk and there is no second copy. **Version 0.1 does not set up a
 backup**; it only reports honestly what exists:
 
 ```bash
-iphone-photos backup status
+immich-photos backup status
 ```
 
 | Line | Meaning |
@@ -33,7 +33,7 @@ A complete backup needs both, on another disk:
 Mount an external disk or a NAS, then:
 
 ```bash
-iphone-photos storage check /mnt/hdd/Immich-Backup
+immich-photos storage check /mnt/hdd/Immich-Backup
 sudo rsync -aHAX --info=progress2 ~/Pictures/Immich/ /mnt/hdd/Immich-Backup/
 ```
 

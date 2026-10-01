@@ -1,20 +1,22 @@
-# Omarchy iPhone Photos
+# Omarchy Immich Photos
 
-Back up the photos and videos on your iPhone to your own Omarchy PC over Wi-Fi.
+Back up the photos and videos on your phone (iPhone or Android) to your own
+Omarchy PC over Wi-Fi.
 [Immich](https://immich.app) does the work; this plugin installs it, watches it
 and puts its controls in the Omarchy bar.
 
 ![Panel](preview.png)
 
 ```text
-iPhone ── Immich iOS app ──Wi-Fi──▶ Immich (Docker) ──▶ ~/Pictures/Immich
-                                         ▲
-                          Omarchy plugin: status, start/stop, QR code
+phone ── Immich mobile app ──Wi-Fi──▶ Immich (Docker) ──▶ ~/Pictures/Immich
+                                           ▲
+                            Omarchy plugin: status, start/stop, QR code,
+                            keyboard photo browser
 ```
 
 ## What it is and is not
 
-Immich provides the iPhone app, the upload, duplicate detection, thumbnails,
+Immich provides the mobile apps, the upload, duplicate detection, thumbnails,
 the gallery and user accounts. The plugin transfers no photos and keeps no
 database of its own. It shows what Immich's official API and the system
 actually report; what cannot be determined is left out rather than estimated.
@@ -26,13 +28,13 @@ actually report; what cannot be determined is left out rather than estimated.
 - Detects an existing Immich installation and integrates it without changing it
 - Checks the storage location (mounted, writable, filesystem, free space)
 - Bar icon with server state and the number of jobs Immich is still processing
-- Panel with photo and video counts, disk usage, when the iPhone was last
+- Panel with photo and video counts, disk usage, when the phone was last
   seen, the server address with QR code, and storage and backup pages
 - Start, stop, restart, logs and diagnostics
 - Keyboard-driven photo browser overlay: view, mark, trash, restore, albums,
   favorites, archive
-- Gallery in its own app window, with an "iPhone Photos" launcher entry
-- `iphone-photos` command line tool with JSON output
+- Gallery in its own app window, with an "Immich Photos" launcher entry
+- `immich-photos` command line tool with JSON output
 
 ## Requirements
 
@@ -46,15 +48,15 @@ All packages come from the official Arch repositories. Nothing from the AUR.
 ## Installation
 
 ```bash
-omarchy plugin add https://github.com/Badr-Emil/omarchy-iphone-photos
-omarchy plugin enable io.github.badr-emil.iphone-photos
+omarchy plugin add https://github.com/Badr-Emil/omarchy-immich-photos
+omarchy plugin enable io.github.badr-emil.immich-photos
 ```
 
 The icon appears in the bar. Until Immich is set up, the panel shows a button
 that opens the installer in a terminal. You can also start it yourself:
 
 ```bash
-~/.config/omarchy/plugins/io.github.badr-emil.iphone-photos/scripts/install.sh
+~/.config/omarchy/plugins/io.github.badr-emil.immich-photos/scripts/install.sh
 ```
 
 The installer explains every system change and asks before making it.
@@ -67,10 +69,10 @@ Details: [docs/installation.md](docs/installation.md)
 | Packages `docker`, `docker-compose`, `qrencode` from the official repositories, if missing | yes | not removed |
 | Enable `docker.service` at boot | yes | undone on request (default: no) |
 | Start the Immich containers (`docker compose up -d`) | yes | removed on request (default: no) |
-| `~/.local/share/omarchy-iphone-photos/immich/` with the compose file and `.env` | no | removed on request (default: no) |
-| `~/.config/omarchy-iphone-photos/` with configuration and API key | no | removed on request (default: no) |
-| Symlink `~/.local/bin/iphone-photos` | no | removed if it points to this plugin |
-| Launcher entry "iPhone Photos" | no | removed if the installer created it |
+| `~/.local/share/omarchy-immich-photos/immich/` with the compose file and `.env` | no | removed on request (default: no) |
+| `~/.config/omarchy-immich-photos/` with configuration and API key | no | removed on request (default: no) |
+| Symlink `~/.local/bin/immich-photos` | no | removed if it points to this plugin |
+| Launcher entry "Immich Photos" | no | removed if the installer created it |
 | Widget entry in `~/.config/omarchy/shell.json` | no | removed |
 
 The installer creates no service of its own and changes no firewall rule, no
@@ -87,7 +89,7 @@ Open `http://localhost:2283` and create an account; the first one becomes the
 administrator. For photo and job counts in the panel, create an API key
 (Account Settings → API Keys, permissions `asset.statistics`,
 `server.statistics`, `queue.read`, `session.read`) and paste it under
-Settings in the panel, or run `iphone-photos api-key set`.
+Settings in the panel, or run `immich-photos api-key set`.
 
 ## Photo browser
 
@@ -95,13 +97,13 @@ A full-screen browser for the photos on the server, operated entirely from the
 keyboard. Open it with
 
 ```bash
-omarchy-shell shell toggle io.github.badr-emil.iphone-photos
+omarchy-shell shell toggle io.github.badr-emil.immich-photos
 ```
 
 or bind that command to a key in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + ALT + P", "iPhone Photos", "omarchy-shell shell toggle io.github.badr-emil.iphone-photos")
+o.bind("SUPER + ALT + P", "Immich Photos", "omarchy-shell shell toggle io.github.badr-emil.immich-photos")
 ```
 
 | Key | Action |
@@ -121,18 +123,18 @@ o.bind("SUPER + ALT + P", "iPhone Photos", "omarchy-shell shell toggle io.github
 The browser needs an API key with these permissions in addition to the four
 above: `asset.read`, `asset.view`, `asset.update`, `asset.delete`,
 `album.read`, `album.create`, `albumAsset.create`. Thumbnails and previews are
-cached in `~/.cache/omarchy-iphone-photos/` (readable by you alone); the
+cached in `~/.cache/omarchy-immich-photos/` (readable by you alone); the
 uninstaller removes that folder with the configuration.
 
-## Set up the iPhone
+## Connect your phone
 
-1. Install Immich from the App Store
+1. Install the Immich app (App Store or Google Play)
 2. Enter the server address shown in the panel, or scan the QR code
 3. Log in
 4. Backup → choose albums → turn Backup on
 
-iOS does not guarantee continuous background uploads; the backup is reliable
-while the app is open. More: [docs/iphone-setup.md](docs/iphone-setup.md)
+Neither iOS nor Android guarantees continuous background uploads; the backup
+is reliable while the app is open. More: [docs/phone-setup.md](docs/phone-setup.md)
 
 ## Storage
 
@@ -160,15 +162,15 @@ state but does not set one up: [docs/backup.md](docs/backup.md)
 ## Command line
 
 ```bash
-iphone-photos status [--json]
-iphone-photos server status|start|stop|restart|logs
-iphone-photos storage status
-iphone-photos storage check <path> [--database]
-iphone-photos backup status
-iphone-photos address [--qr]
-iphone-photos api-key set|clear|status
-iphone-photos open [--browser]
-iphone-photos diagnostics
+immich-photos status [--json]
+immich-photos server status|start|stop|restart|logs
+immich-photos storage status
+immich-photos storage check <path> [--database]
+immich-photos backup status
+immich-photos address [--qr]
+immich-photos api-key set|clear|status
+immich-photos open [--browser]
+immich-photos diagnostics
 ```
 
 ## Tests
@@ -182,13 +184,13 @@ validation and `qmllint`.
 
 ## Troubleshooting
 
-`iphone-photos diagnostics`, then [docs/troubleshooting.md](docs/troubleshooting.md)
+`immich-photos diagnostics`, then [docs/troubleshooting.md](docs/troubleshooting.md)
 
 ## Removal
 
 ```bash
-~/.config/omarchy/plugins/io.github.badr-emil.iphone-photos/scripts/uninstall.sh
-omarchy plugin remove io.github.badr-emil.iphone-photos
+~/.config/omarchy/plugins/io.github.badr-emil.immich-photos/scripts/uninstall.sh
+omarchy plugin remove io.github.badr-emil.immich-photos
 ```
 
 The script removes only what the installer of this plugin created. An Immich
@@ -211,4 +213,5 @@ sudo docker volume rm immich_model-cache
 
 ## License
 
-MIT
+MIT. This is an independent community plugin, not affiliated with or endorsed
+by the Immich project.

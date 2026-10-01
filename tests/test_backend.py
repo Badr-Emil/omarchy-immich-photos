@@ -1,4 +1,4 @@
-"""Tests for backend/iphone-photos. No Docker and no running Immich needed.
+"""Tests for backend/immich-photos. No Docker and no running Immich needed.
 
 Run with: python3 -B -m unittest discover -s tests
 """
@@ -21,9 +21,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
 
-BACKEND = Path(__file__).resolve().parent.parent / "backend" / "iphone-photos"
-loader = importlib.machinery.SourceFileLoader("iphone_photos", str(BACKEND))
-spec = importlib.util.spec_from_loader("iphone_photos", loader)
+BACKEND = Path(__file__).resolve().parent.parent / "backend" / "immich-photos"
+loader = importlib.machinery.SourceFileLoader("immich_photos", str(BACKEND))
+spec = importlib.util.spec_from_loader("immich_photos", loader)
 ip = importlib.util.module_from_spec(spec)
 loader.exec_module(ip)
 
@@ -45,7 +45,7 @@ class IsolatedHome(unittest.TestCase):
         # Not /tmp: the storage check rightly refuses temporary filesystems.
         cache = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
         cache.mkdir(parents=True, exist_ok=True)
-        self.tmp = tempfile.TemporaryDirectory(prefix="iphone-photos-test-", dir=cache)
+        self.tmp = tempfile.TemporaryDirectory(prefix="immich-photos-test-", dir=cache)
         self.home = Path(self.tmp.name)
         patcher = mock.patch.dict(os.environ, {
             "HOME": str(self.home),
@@ -273,14 +273,14 @@ class StatusParsing(unittest.TestCase):
         state, message, suggestion = ip.derive_state(True, True, True, False, False)
         self.assertEqual(state, "stopped")
         self.assertIn("immich_server is stopped", message)
-        self.assertEqual(suggestion, "iphone-photos server start")
+        self.assertEqual(suggestion, "immich-photos server start")
         state, message, _ = ip.derive_state(True, True, False, False, False)
         self.assertIn("Docker daemon is not running", message)
 
     def test_state_port_open_but_no_answer(self):
         state, _, suggestion = ip.derive_state(True, True, True, True, False)
         self.assertEqual(state, "problem")
-        self.assertEqual(suggestion, "iphone-photos server logs")
+        self.assertEqual(suggestion, "immich-photos server logs")
 
     def test_queue_summary(self):
         queues = [
@@ -301,7 +301,7 @@ class StatusParsing(unittest.TestCase):
     def test_queue_summary_of_idle_server(self):
         self.assertEqual(ip.summarize_queues([])["pending"], 0)
 
-    def test_sessions_newest_first_and_iphone_detected(self):
+    def test_sessions_newest_first_and_phone_app_detected(self):
         sessions = [
             {"deviceType": "Chrome", "deviceOS": "Linux", "updatedAt": "2026-10-01T08:00:00Z", "appVersion": None},
             {"deviceType": "iPhone", "deviceOS": "iOS", "updatedAt": "2026-10-01T09:30:00Z", "appVersion": "3.2.4"},
@@ -310,8 +310,15 @@ class StatusParsing(unittest.TestCase):
         devices = ip.summarize_sessions(sessions)
         self.assertEqual(len(devices), 2)
         self.assertEqual(devices[0]["deviceOS"], "iOS")
-        self.assertTrue(ip.is_iphone(devices[0]))
-        self.assertFalse(ip.is_iphone(devices[1]))
+        self.assertTrue(ip.is_phone_app(devices[0]))
+        self.assertFalse(ip.is_phone_app(devices[1]))
+
+    def test_android_app_counts_and_mobile_browser_does_not(self):
+        devices = ip.summarize_sessions([
+            {"deviceType": "Pixel 8", "deviceOS": "Android", "appVersion": "3.2.1", "updatedAt": "2026-10-01T08:00:00Z"},
+            {"deviceType": "Mobile Safari", "deviceOS": "iOS", "appVersion": None, "updatedAt": "2026-10-01T09:00:00Z"},
+        ])
+        self.assertEqual([ip.is_phone_app(device) for device in devices], [False, True])
 
     def test_compose_ps_array_and_lines(self):
         row = {"Name": "immich_server", "Service": "immich-server", "State": "running", "Health": "healthy"}
@@ -519,7 +526,7 @@ class StatusCollection(WithFakeImmich):
         self.assertFalse(status["server"]["online"])
         self.assertIsNone(status["server"]["version"])
         self.assertEqual(status["database"]["status"], "unknown")
-        self.assertEqual(status["suggestion"], "iphone-photos server start")
+        self.assertEqual(status["suggestion"], "immich-photos server start")
         self.assertIsNotNone(status["storage"]["freeBytes"])
 
     def test_docker_not_installed(self):
@@ -607,6 +614,7 @@ class Setup(IsolatedHome):
         self.assertRegex(env["DB_PASSWORD"], r"^[A-Za-z0-9]{40}$")
         self.assertEqual(stat.S_IMODE((stack / ".env").stat().st_mode), 0o600)
         self.assertEqual((stack / "docker-compose.yml").read_text(), self.COMPOSE)
+        self.assertTrue((stack / ip.OWNERSHIP_MARKER).is_file())
         self.assertNotIn(env["DB_PASSWORD"], output)
         self.assertTrue(media.is_dir())
 

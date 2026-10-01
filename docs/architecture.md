@@ -3,7 +3,7 @@
 ## Data path
 
 ```text
-iPhone ── Immich iOS app ──Wi-Fi──▶ Immich server (Docker) ──▶ UPLOAD_LOCATION
+phone ── Immich mobile app ──Wi-Fi──▶ Immich server (Docker) ──▶ UPLOAD_LOCATION
 ```
 
 The plugin is not part of this path. It transfers no photos, keeps no database
@@ -16,25 +16,25 @@ running unchanged.
 Panel.qml  (Quickshell, inside the running omarchy-shell)
    │  starts a process, reads JSON
    ▼
-backend/iphone-photos  (Python, standard library only)
+backend/immich-photos  (Python, standard library only)
    ├── HTTP ─▶ Immich API   http://127.0.0.1:2283/api
    ├── docker compose        directly, or through sudo / pkexec
    └── statvfs / findmnt     free space, filesystem
 ```
 
-QML contains presentation only. It runs `iphone-photos status --json` and
+QML contains presentation only. It runs `immich-photos status --json` and
 shows what comes back. The API key never leaves the backend.
 
 ## Locations
 
 | What | Path | Mode |
 |---|---|---|
-| Plugin (this repository) | `~/.config/omarchy/plugins/io.github.badr-emil.iphone-photos` | |
-| `iphone-photos` command | `~/.local/bin/iphone-photos` → `backend/iphone-photos` | symlink |
-| Compose file, `.env` | `~/.local/share/omarchy-iphone-photos/immich/` | directory 700, `.env` 600 |
-| Database | `~/.local/share/omarchy-iphone-photos/postgres/` | managed by the container |
-| Plugin configuration | `~/.config/omarchy-iphone-photos/config.json` | 600 |
-| API key | `~/.config/omarchy-iphone-photos/api-key` | 600 |
+| Plugin (this repository) | `~/.config/omarchy/plugins/io.github.badr-emil.immich-photos` | |
+| `immich-photos` command | `~/.local/bin/immich-photos` → `backend/immich-photos` | symlink |
+| Compose file, `.env` | `~/.local/share/omarchy-immich-photos/immich/` | directory 700, `.env` 600 |
+| Database | `~/.local/share/omarchy-immich-photos/postgres/` | managed by the container |
+| Plugin configuration | `~/.config/omarchy-immich-photos/config.json` | 600 |
+| API key | `~/.config/omarchy-immich-photos/api-key` | 600 |
 | Media | `UPLOAD_LOCATION`, default `~/Pictures/Immich` | |
 
 The truth about the media and database paths is Immich's `.env`. The backend
@@ -74,9 +74,10 @@ row. There are no placeholder values.
 
 ### What Immich does not provide
 
-- **"iPhone is syncing right now"** does not exist in the API. The panel shows
-  when the iPhone app last talked to the server (`updatedAt` of the session
-  whose `deviceOS` is iOS). Immich refreshes that timestamp at most once an
+- **"The phone is syncing right now"** does not exist in the API. The panel
+  shows when the Immich mobile app last talked to the server (`updatedAt` of
+  the newest session that reports an app version, on iOS or Android; browser
+  sessions do not count). Immich refreshes that timestamp at most once an
   hour.
 - **"Photos still to upload"** is known only to the phone. The number in the
   bar is the number of jobs the server still has to process (thumbnails,
@@ -111,14 +112,14 @@ The plugin runs inside the existing `omarchy-shell` process; no second
 Quickshell is started. Pages of the panel can be opened directly:
 
 ```bash
-omarchy-shell io.github.badr-emil.iphone-photos toggle
-omarchy-shell io.github.badr-emil.iphone-photos.page go setup   # storage, backup, settings
+omarchy-shell io.github.badr-emil.immich-photos toggle
+omarchy-shell io.github.badr-emil.immich-photos.page go setup   # storage, backup, settings
 ```
 
 ## Photo browser
 
 `Gallery.qml` is the plugin's second entry point, an `overlay` that
-`omarchy-shell shell toggle io.github.badr-emil.iphone-photos` opens as a
+`omarchy-shell shell toggle io.github.badr-emil.immich-photos` opens as a
 full-screen layer with exclusive keyboard focus, like Omarchy's own image
 picker. It follows the same rule as the panel: QML shows, the backend talks.
 
@@ -132,7 +133,7 @@ picker. It follows the same rule as the panel: QML shows, the backend talks.
 | `gallery albums`, `album-add`, `album-create` | `GET /albums`, `PUT /albums/{id}/assets`, `POST /albums` |
 | `gallery play <id>` | `GET /assets/{id}`, then the original file from `UPLOAD_LOCATION` |
 
-Images reach QML as files in `~/.cache/omarchy-iphone-photos/` (directory 700,
+Images reach QML as files in `~/.cache/omarchy-immich-photos/` (directory 700,
 files 600), so the API key never appears in a URL or in QML. Ids are accepted
 only if they are UUIDs, because they become part of URLs and file names.
 Deleting always means Immich's trash; the backend has no code path for
@@ -156,7 +157,7 @@ There is no automatic `mv` and no `rsync --delete`.
 
 ## Backup (prepared, not implemented)
 
-In version 0.1, `iphone-photos backup status` reports only what can be
+In version 0.1, `immich-photos backup status` reports only what can be
 established: whether Immich writes database dumps to `UPLOAD_LOCATION/backups`
 and whether a backup target is configured. A target cannot be configured yet,
 so the honest answer is "not configured".

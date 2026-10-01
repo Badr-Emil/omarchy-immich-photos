@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.badr-emil.iphone-photos",
-  "name": "iPhone Photos",
+  "id": "io.github.badr-emil.immich-photos",
+  "name": "Immich Photos",
   "version": "0.1.0",
   "author": "Badr-Emil",
   "license": "MIT",
-  "description": "Back up iPhone photos and videos to this PC over Wi-Fi with a local Immich server: install, monitor and control it from the Omarchy bar, and browse the photos with the keyboard.",
+  "description": "Back up the photos and videos on your phone to this PC over Wi-Fi with a local Immich server: install, monitor and control it from the Omarchy bar, and browse the photos with the keyboard.",
   "kinds": [
     "bar-widget",
     "overlay"
@@ -15,13 +15,14 @@
     "overlay": "Gallery.qml"
   },
   "barWidget": {
-    "displayName": "iPhone Photos",
-    "description": "Status of the local Immich server, photo and video counts, storage, the server address and QR code for the iPhone, and start/stop controls.",
+    "displayName": "Immich Photos",
+    "description": "Status of the local Immich server, photo and video counts, storage, the server address and QR code for the phone, and start/stop controls.",
     "category": "Network",
     "aliases": [
+      "immich",
+      "android",
       "iphone",
       "photos",
-      "immich",
       "backup"
     ],
     "allowMultiple": false,

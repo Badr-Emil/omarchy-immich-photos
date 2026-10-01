@@ -6,11 +6,11 @@ import qs.Commons
 import qs.Ui
 
 // Bar icon and panel for a local Immich server. All data comes from
-// backend/iphone-photos as JSON; nothing here talks to Immich or Docker.
+// backend/immich-photos as JSON; nothing here talks to Immich or Docker.
 Panel {
   id: root
-  moduleName: "io.github.badr-emil.iphone-photos"
-  ipcTarget: "io.github.badr-emil.iphone-photos"
+  moduleName: "io.github.badr-emil.immich-photos"
+  ipcTarget: "io.github.badr-emil.immich-photos"
 
   property var status: null
   property bool failed: false
@@ -26,8 +26,8 @@ Panel {
   readonly property string pluginPath: decodeURIComponent(
     Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
   )
-  readonly property string backend: pluginPath + "backend/iphone-photos"
-  readonly property string qrFile: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-iphone-photos/"
+  readonly property string backend: pluginPath + "backend/immich-photos"
+  readonly property string qrFile: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-immich-photos/"
     + serverUrl.replace(/[^A-Za-z0-9]/g, "_") + ".png"
   readonly property int refreshInterval: Math.max(5, Number(setting("refreshIntervalSec", 15)) || 15) * 1000
   readonly property bool showCount: setting("showCount", true) === true
@@ -306,7 +306,7 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  // omarchy-shell io.github.badr-emil.iphone-photos.page go setup
+  // omarchy-shell io.github.badr-emil.immich-photos.page go setup
   IpcHandler {
     target: root.ipcTarget + ".page"
 
@@ -346,7 +346,7 @@ Panel {
         }
       }
     }
-    tooltipText: root.opened ? "" : "iPhone Photos · " + root.heroStatusText
+    tooltipText: root.opened ? "" : "Immich Photos · " + root.heroStatusText
       + (root.serverUrl !== "" && root.online ? "\n" + root.serverUrl : "")
       + "\n\nLeft: panel · Right: open gallery"
     onPressed: function(buttonCode) {
@@ -425,11 +425,11 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: root.page === "setup" ? "Connect iPhone"
+              text: root.page === "setup" ? "Connect phone"
                 : root.page === "storage" ? "Storage"
                 : root.page === "backup" ? "Backup"
                 : root.page === "settings" ? "Settings"
-                : "iPhone Photos"
+                : "Immich Photos"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
@@ -574,7 +574,7 @@ Panel {
 
             InfoRow {
               visible: root.status !== null && root.status.lastActivity !== null
-              label: "iPhone last seen"
+              label: "Phone last seen"
               value: root.status && root.status.lastActivity ? root.formatLastSeen(root.status.lastActivity) : ""
             }
           }
@@ -629,7 +629,7 @@ Panel {
               width: parent.width
               leftAlign: true
               iconText: "󰐲"
-              text: "Connect iPhone"
+              text: "Connect phone"
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: root.show("setup")
@@ -699,7 +699,7 @@ Panel {
           }
         }
 
-        // ---------- iPhone setup ----------
+        // ---------- Phone setup ----------
         Column {
           visible: root.page === "setup"
           width: parent.width
@@ -709,7 +709,7 @@ Panel {
 
           Hint {
             visible: root.serverUrl === ""
-            text: "This PC has no address in the local network. Connect it to the Wi-Fi the iPhone uses."
+            text: "This PC has no address in the local network. Connect it to the Wi-Fi your phone uses."
             color: root.urgent
           }
 
@@ -778,14 +778,14 @@ Panel {
 
           Hint {
             color: root.foreground
-            text: "1. Install Immich from the App Store on the iPhone\n"
+            text: "1. Install the Immich app on your phone (App Store or Google Play)\n"
               + "2. Enter the server address or scan the QR code\n"
               + "3. Log in with your Immich account\n"
               + "4. Open Backup, choose albums, turn Backup on"
           }
 
           Hint {
-            text: "The iPhone has to be in the same Wi-Fi. iOS decides when apps may work in the background. "
+            text: "The phone has to be in the same Wi-Fi. iOS and Android decide when apps may work in the background. "
               + "The backup is reliable while the Immich app is open."
           }
         }
@@ -1055,7 +1055,7 @@ Panel {
             text: "In Immich: Account Settings → API Keys → New API Key. Required permissions: "
               + "asset.statistics, server.statistics, queue.read, session.read; for the photo browser also "
               + "asset.read, asset.view, asset.update, asset.delete, album.read, album.create, albumAsset.create. "
-              + "The key is stored only in ~/.config/omarchy-iphone-photos/api-key (readable by you alone)."
+              + "The key is stored only in ~/.config/omarchy-immich-photos/api-key (readable by you alone)."
           }
         }
       }

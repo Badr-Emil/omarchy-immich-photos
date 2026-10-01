@@ -7,15 +7,13 @@
 
 set -euo pipefail
 
-PLUGIN_ID="io.github.badr-emil.iphone-photos"
+PLUGIN_ID="io.github.badr-emil.immich-photos"
 REPO_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)
-BACKEND="$REPO_DIR/backend/iphone-photos"
+BACKEND="$REPO_DIR/backend/immich-photos"
 PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-iphone-photos"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-iphone-photos"
-OWN_COMPOSE_DIR="$DATA_DIR/immich"
-BIN_LINK="$HOME/.local/bin/iphone-photos"
-APP_NAME="iPhone Photos"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-immich-photos"
+BIN_LINK="$HOME/.local/bin/immich-photos"
+APP_NAME="Immich Photos"
 LAUNCHER="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$APP_NAME.desktop"
 
 ask() {
@@ -57,7 +55,7 @@ fi
 containers_removed=false
 if [[ -z $compose_dir ]]; then
   :
-elif [[ $compose_dir != "$OWN_COMPOSE_DIR" ]]; then
+elif [[ ! -f $compose_dir/.installed-by-immich-photos ]]; then
   echo "Immich in $compose_dir was not installed by this plugin and is left running."
 elif ask "Stop and remove the Immich containers? (photos and database stay)" n; then
   # `down` without -v: named volumes and all bind-mounted data are kept.
@@ -84,14 +82,14 @@ if ask "Remove the plugin configuration and the stored API key?" n; then
   rm -f "$CONFIG_DIR/api-key" "$CONFIG_DIR/config.json" "$CONFIG_DIR/enabled-docker-at-boot"
   rmdir "$CONFIG_DIR" 2>/dev/null || true
   # Thumbnails and previews the photo browser downloaded; nothing else lives there.
-  rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-iphone-photos"
+  rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-immich-photos"
   echo "Configuration removed."
   if $containers_removed; then
     echo
     echo "$compose_dir/.env holds the database password. Without it the existing"
     echo "database cannot be opened by a later installation."
     if ask "Remove the Immich compose folder including .env anyway?" n; then
-      rm -f "$compose_dir/docker-compose.yml" "$compose_dir/.env"
+      rm -f "$compose_dir/docker-compose.yml" "$compose_dir/.env" "$compose_dir/.installed-by-immich-photos"
       rmdir "$compose_dir" 2>/dev/null || true
       echo "Compose folder removed."
     fi

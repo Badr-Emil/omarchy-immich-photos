@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Installs Immich with the official Docker Compose files and adds the
-# iPhone Photos plugin to the Omarchy bar. An existing Immich installation is
+# Immich Photos plugin to the Omarchy bar. An existing Immich installation is
 # detected and integrated, never replaced.
 #
 #   ./scripts/install.sh                  interactive
@@ -10,14 +10,14 @@
 
 set -euo pipefail
 
-PLUGIN_ID="io.github.badr-emil.iphone-photos"
+PLUGIN_ID="io.github.badr-emil.immich-photos"
 REPO_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)
-BACKEND="$REPO_DIR/backend/iphone-photos"
+BACKEND="$REPO_DIR/backend/immich-photos"
 PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
-BIN_LINK="$HOME/.local/bin/iphone-photos"
-APP_NAME="iPhone Photos"
+BIN_LINK="$HOME/.local/bin/immich-photos"
+APP_NAME="Immich Photos"
 LAUNCHER="${XDG_DATA_HOME:-$HOME/.local/share}/applications/$APP_NAME.desktop"
-STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-iphone-photos"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-immich-photos"
 
 MEDIA=""
 ASSUME_YES=false
@@ -61,7 +61,7 @@ if [[ $(uname -m) == x86_64 ]] && ! grep -qw sse4_2 /proc/cpuinfo; then
 fi
 if ! command -v qrencode >/dev/null; then
   pacman -Si qrencode >/dev/null 2>&1 || fail "The package qrencode was not found in the repositories."
-  echo "qrencode (official Arch package) draws the QR code for the iPhone."
+  echo "qrencode (official Arch package) draws the QR code for the phone."
   confirm "Install qrencode?" && omarchy pkg add qrencode
 fi
 
@@ -134,7 +134,7 @@ EOF
     # Remembered so the uninstaller can offer to undo exactly this change.
     mkdir -p "$STATE_DIR" && touch "$STATE_DIR/enabled-docker-at-boot"
   else
-    echo "Skipped. After a reboot, start Immich with: iphone-photos server start"
+    echo "Skipped. After a reboot, start Immich with: immich-photos server start"
   fi
 fi
 if [[ $(state state) == online || $(state state) == busy ]]; then
@@ -160,7 +160,7 @@ Nothing was changed. To restrict it to private networks: sudo ufw-docker install
 EOF
   fi
 elif systemctl is-active --quiet firewalld; then
-  echo "firewalld is active. If the iPhone cannot connect, allow 2283/tcp in the zone of your home network."
+  echo "firewalld is active. If the phone cannot connect, allow 2283/tcp in the zone of your home network."
 else
   echo "No active firewall found. Port 2283/tcp is reachable from every network this PC is in."
 fi
@@ -205,18 +205,18 @@ fi
 step "Status"
 "$BACKEND" status || true
 
-step "Connect your iPhone"
+step "Connect your phone"
 if url=$("$BACKEND" address --qr); then
   cat <<EOF
 
   1. On this PC, open http://localhost:${url##*:} and create your account
      (the first account becomes the administrator).
-  2. Install "Immich" from the App Store on the iPhone.
-  3. Enter the server address above or scan the QR code with the iPhone camera.
+  2. Install the Immich app on your phone (App Store or Google Play).
+  3. Enter the server address above or scan the QR code in the app.
      It contains only the address, no password.
   4. Log in, open Backup, choose the albums, turn Backup on.
 
-The iPhone has to be in the same Wi-Fi. iOS decides when apps may work in the
+The phone has to be in the same Wi-Fi. iOS and Android decide when apps may work in the
 background; the backup is reliable while the Immich app is open.
 
 Your photos are stored on a single disk. Read docs/backup.md.

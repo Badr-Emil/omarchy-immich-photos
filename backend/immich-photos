@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Management and monitoring CLI for a local Immich server.
 
-The photo pipeline is iPhone -> Immich iOS app -> Immich server. This tool is
+The photo pipeline is phone -> Immich mobile app -> Immich server. This tool is
 not part of it: it installs the official Immich compose stack, starts and stops
 it, and reports what the Immich API and the local system can actually tell.
 """
@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-APP = "omarchy-iphone-photos"
+APP = "omarchy-immich-photos"
 CONTAINER_PORT = 2283
 # The compose file runs as root through Docker, so it is pinned to a release
 # and checked against the hashes below instead of following "latest". A newer
@@ -41,6 +41,7 @@ RELEASE_SHA256 = {
     "example.env": "dda820cecbcf5fd5d6afecc54107bbd3c973088c631d380dfc83e9f0f2c6b210",
 }
 DOCKER_SOCKET = "/var/run/docker.sock"
+OWNERSHIP_MARKER = ".installed-by-immich-photos"
 
 GIB = 1024**3
 MIN_FREE_BYTES = 1 * GIB
@@ -580,8 +581,9 @@ def summarize_sessions(sessions):
     return devices
 
 
-def is_iphone(device):
-    return "ios" in device["deviceOS"].lower() or "iphone" in device["deviceType"].lower()
+def is_phone_app(device):
+    """True for a session of the Immich mobile app; browsers send no app version."""
+    return bool(device["appVersion"])
 
 
 def derive_state(installed, docker_present, daemon_active, port_open, ping_ok, maintenance=False, pending_jobs=0):
@@ -599,12 +601,12 @@ def derive_state(installed, docker_present, daemon_active, port_open, ping_ok, m
         return ("online", "Immich is online.", "")
     if not daemon_active:
         return ("stopped", "Immich server is not reachable.\nThe Docker daemon is not running.",
-                "iphone-photos server start")
+                "immich-photos server start")
     if not port_open:
         return ("stopped", "Immich server is not reachable.\nDocker container immich_server is stopped.",
-                "iphone-photos server start")
+                "immich-photos server start")
     return ("problem", "Immich server is not answering.\nThe port is open but the API does not respond; "
-            "the server may still be starting.", "iphone-photos server logs")
+            "the server may still be starting.", "immich-photos server logs")
 
 
 # --------------------------------------------------------------------------
@@ -667,7 +669,7 @@ def collect_status(installation=None):
             note(notes, "no-admin", "No admin account yet. Open %s and create one." % local_url)
         elif not api_key:
             note(notes, "no-key", "No API key configured: photo counts and job status are not available. "
-                 "Run: iphone-photos api-key set")
+                 "Run: immich-photos api-key set")
         else:
             library_bytes = collect_authenticated(api, status, notes)
     elif status["docker"]["containers"] is not None:
@@ -719,7 +721,7 @@ def collect_authenticated(api, status, notes):
         capabilities["adminApi"] = capabilities["userApi"] = True
     except ApiError as error:
         if error.kind == "unauthorized":
-            note(notes, "key-rejected", "The API key was rejected. Create a new one and run: iphone-photos api-key set")
+            note(notes, "key-rejected", "The API key was rejected. Create a new one and run: immich-photos api-key set")
             return None
         try:
             stats = api.get("/assets/statistics", authenticated=True)
@@ -736,7 +738,7 @@ def collect_authenticated(api, status, notes):
     try:
         devices = summarize_sessions(api.get("/sessions", authenticated=True))
         status["devices"] = devices
-        phones = [device for device in devices if is_iphone(device)] or devices
+        phones = [device for device in devices if is_phone_app(device)] or devices
         status["lastActivity"] = phones[0]["lastSeen"] if phones else None
     except (ApiError, AttributeError, TypeError, ValueError):
         pass
@@ -1077,7 +1079,7 @@ def setup(media, database=None, compose_dir=None, fetch=download):
     existing = find_installation()
     if existing.installed:
         fail("Immich is already installed in %s. Nothing was changed." % existing.compose_dir,
-             "iphone-photos integrate %s" % existing.compose_dir, code=3)
+             "immich-photos integrate %s" % existing.compose_dir, code=3)
     if port_listening(CONTAINER_PORT):
         fail("Port %d is already in use by another program. Nothing was changed." % CONTAINER_PORT,
              "Find it with: ss -ltnp | grep %d" % CONTAINER_PORT, code=3)
@@ -1122,6 +1124,8 @@ def setup(media, database=None, compose_dir=None, fetch=download):
         run(["chattr", "+C", str(database)])
     write_private(compose_dir / "docker-compose.yml", compose)
     write_private(compose_dir / ".env", env_text)
+    # Lets the uninstaller tell this installation from one it only integrated.
+    write_private(compose_dir / OWNERSHIP_MARKER, "Installed by the Omarchy plugin Immich Photos.\n")
 
     config = load_config()
     config["composeDir"] = str(compose_dir)
@@ -1202,7 +1206,7 @@ def print_status(status):
     database = status["database"]["status"]
     section("Database", [("Status", "Healthy (server is answering)" if database == "reachable" else database)])
     if status["lastActivity"]:
-        section("iPhone", [("Last seen", status["lastActivity"] + " (accurate to about an hour)")])
+        section("Phone", [("Last seen", status["lastActivity"] + " (accurate to about an hour)")])
     for entry in status["notes"]:
         print("Note: %s" % entry["text"])
     if status["state"] not in ("online", "busy"):
@@ -1267,7 +1271,7 @@ def print_diagnostics(status, installation):
         section("Containers", [(c["name"], " ".join(filter(None, [c["state"], c["health"]])))
                                for c in docker["containers"]])
     elif status["installed"]:
-        print("Container details need Docker access: iphone-photos server status\n")
+        print("Container details need Docker access: immich-photos server status\n")
     for entry in status["notes"]:
         print("Note: %s" % entry["text"])
     if status["state"] not in ("online", "busy"):
@@ -1291,7 +1295,7 @@ def write_qr(url, path):
 # --------------------------------------------------------------------------
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="iphone-photos", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="immich-photos", description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
     status = commands.add_parser("status", help="overall status")
@@ -1311,7 +1315,7 @@ def build_parser():
     backup.add_argument("action", choices=["status"])
     backup.add_argument("--json", action="store_true")
 
-    address = commands.add_parser("address", help="server address for the iPhone")
+    address = commands.add_parser("address", help="server address for the phone")
     address.add_argument("--qr", action="store_true", help="show a QR code in the terminal")
     address.add_argument("--qr-file", metavar="PNG", help="write the QR code to a PNG file")
 
@@ -1376,17 +1380,17 @@ def main(argv=None):
             return run_compose(installation, "stop")
         code = run_compose(installation, *(("up", "-d") if args.action == "start" else ("restart",)))
         if code != 0:
-            fail("Docker could not %s Immich (exit code %d)." % (args.action, code), "iphone-photos server logs")
+            fail("Docker could not %s Immich (exit code %d)." % (args.action, code), "immich-photos server logs")
         print("Waiting for Immich to answer…")
         if not wait_until_online(installation):
-            fail("The containers were started but Immich is not answering yet.", "iphone-photos server logs")
+            fail("The containers were started but Immich is not answering yet.", "immich-photos server logs")
         print("Immich is online at http://localhost:%d" % installation.port)
         return 0
 
     if command == "storage":
         if args.action == "check":
             if not args.path:
-                fail("Give the path to check, for example: iphone-photos storage check ~/Pictures/Immich")
+                fail("Give the path to check, for example: immich-photos storage check ~/Pictures/Immich")
             check = check_storage(args.path, "database" if args.database else "media")
             if args.json:
                 print(json.dumps(check))

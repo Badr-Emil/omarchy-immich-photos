@@ -7,8 +7,8 @@ import qs.Commons
 import qs.Ui
 
 // Keyboard-driven photo browser. Opened with
-//   omarchy-shell shell toggle io.github.badr-emil.iphone-photos
-// All data and every change go through `backend/iphone-photos gallery`, which
+//   omarchy-shell shell toggle io.github.badr-emil.immich-photos
+// All data and every change go through `backend/immich-photos gallery`, which
 // talks to the Immich API; images are shown from its local cache.
 Item {
   id: root
@@ -33,7 +33,7 @@ Item {
   readonly property string pluginPath: decodeURIComponent(
     Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "")
   )
-  readonly property string backend: pluginPath + "backend/iphone-photos"
+  readonly property string backend: pluginPath + "backend/immich-photos"
   readonly property var current: items.length > 0 && index < items.length ? items[index] : null
   readonly property bool browsing: mode === "grid" || mode === "view"
   // A dialog keeps showing whatever was behind it.
@@ -371,7 +371,7 @@ Item {
     visible: root.opened
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
-    WlrLayershell.namespace: "omarchy-iphone-photos"
+    WlrLayershell.namespace: "omarchy-immich-photos"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
@@ -422,7 +422,7 @@ Item {
 
           Text {
             textFormat: Text.PlainText
-            text: "iPhone Photos"
+            text: "Immich Photos"
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
