@@ -13,6 +13,7 @@ sys.dont_write_bytecode = True
 import argparse
 import getpass
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
@@ -21,6 +22,7 @@ import secrets
 import shutil
 import socket
 import string
+import struct
 import subprocess
 import time
 import urllib.error
@@ -41,6 +43,7 @@ RELEASE_SHA256 = {
     "example.env": "dda820cecbcf5fd5d6afecc54107bbd3c973088c631d380dfc83e9f0f2c6b210",
 }
 DOCKER_SOCKET = "/var/run/docker.sock"
+SOCKET_TABLES = ("/proc/net/tcp", "/proc/net/tcp6")
 OWNERSHIP_MARKER = ".installed-by-immich-photos"
 
 GIB = 1024**3
@@ -294,6 +297,60 @@ def port_listening(port, host="127.0.0.1"):
         return False
 
 
+def kernel_hex(packed):
+    """An address the way /proc/net/tcp prints it: 32-bit words in host byte order."""
+    return "".join("%08X" % word for word in struct.unpack("=%dI" % (len(packed) // 4), packed))
+
+
+def loopback_listen_addresses():
+    """Every bind address whose listener receives a connection to 127.0.0.1."""
+    plain = [socket.inet_aton(address) for address in ("127.0.0.1", "0.0.0.0")]
+    mapped = [bytes(10) + b"\xff\xff" + address for address in plain]
+    return {kernel_hex(address) for address in plain + mapped + [bytes(16)]}
+
+
+def listener_owners(port, tables=SOCKET_TABLES):
+    """User ids that own the sockets listening for 127.0.0.1:port.
+
+    Read from the kernel's socket table, which a program cannot forge. None
+    when the table is not readable.
+    """
+    accepted = loopback_listen_addresses()
+    owners = set()
+    for index, table in enumerate(tables):
+        try:
+            rows = Path(table).read_text().splitlines()[1:]
+        except OSError:
+            if index == 0:
+                return None
+            continue  # no IPv6 on this system
+        for row in rows:
+            fields = row.split()
+            if len(fields) < 8 or fields[3] != "0A":  # 0A is TCP_LISTEN
+                continue
+            address, _, row_port = fields[1].rpartition(":")
+            try:
+                if int(row_port, 16) == port and address in accepted:
+                    owners.add(int(fields[7]))
+            except ValueError:
+                continue
+    return owners
+
+
+def port_holder(port):
+    """Whose program answers on 127.0.0.1:port: "trusted", "foreign" or "unknown".
+
+    Immich's port is above 1023, so while Immich is stopped any local user may
+    bind it and pose as the server. Docker publishes the port as root, rootless
+    Docker as this user; a listener of anyone else is not Immich. "unknown"
+    means nothing is listening or the kernel table is not readable.
+    """
+    owners = listener_owners(port)
+    if not owners:
+        return "unknown"
+    return "trusted" if owners <= {0, os.getuid()} else "foreign"
+
+
 def outbound_address():
     """Address of the interface that carries the default route. Sends nothing."""
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -483,8 +540,53 @@ class ApiError(Exception):
         self.status = status
 
 
+class VerifiedConnection(http.client.HTTPConnection):
+    """Connects only to a port that Docker or this user holds.
+
+    Checked before and after connecting, so the listener cannot be swapped in
+    between. Nothing is written to the socket unless both checks pass.
+    """
+
+    def require_trusted(self):
+        holder = port_holder(self.port)
+        if holder == "foreign":
+            raise ApiError("untrusted", "Port %d is held by a program of another user, not by Immich. "
+                           "Nothing was sent to it." % self.port)
+        if holder != "trusted":
+            raise ApiError("unreachable", "Immich is not reachable at http://%s:%d." % (self.host, self.port))
+
+    def connect(self):
+        self.require_trusted()
+        super().connect()
+        try:
+            self.require_trusted()
+        except ApiError:
+            self.close()
+            raise
+
+
+class VerifiedHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(VerifiedConnection, request)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the API key to an address nobody checked."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# No proxy either: the request must reach the port that was checked.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), VerifiedHandler, NoRedirect)
+
+
 class ImmichApi:
-    """Minimal client for the documented Immich REST API (OpenAPI v3.x)."""
+    """Minimal client for the documented Immich REST API (OpenAPI v3.x).
+
+    Only for a server on this PC: every connection goes through
+    VerifiedConnection, with or without the API key.
+    """
 
     def __init__(self, base_url, api_key=None, timeout=4):
         self.base_url = base_url.rstrip("/")
@@ -508,7 +610,7 @@ class ImmichApi:
                 raise ApiError("no-key", "No API key configured.")
             request.add_header("x-api-key", self.api_key)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with OPENER.open(request, timeout=timeout) as response:
                 payload = response.read()
         except urllib.error.HTTPError as error:
             error.close()
@@ -588,7 +690,8 @@ def is_phone_app(device):
     return bool(device["appVersion"])
 
 
-def derive_state(installed, docker_present, daemon_active, port_open, ping_ok, maintenance=False, pending_jobs=0):
+def derive_state(installed, docker_present, daemon_active, port_open, ping_ok, maintenance=False, pending_jobs=0,
+                 holder="trusted", port=CONTAINER_PORT):
     """Single word describing the whole setup, plus what to tell the user."""
     if not docker_present:
         return ("no-docker", "Docker is not installed.",
@@ -601,12 +704,19 @@ def derive_state(installed, docker_present, daemon_active, port_open, ping_ok, m
         if pending_jobs:
             return ("busy", "Immich is online and processing %d jobs." % pending_jobs, "")
         return ("online", "Immich is online.", "")
+    if port_open and holder == "foreign":
+        return ("problem", "Port %d is held by a program of another user on this PC, not by Immich.\n"
+                "Nothing is sent to it, and Immich cannot start while it is there." % port,
+                "Find its owner with: ss -ltne | grep :%d" % port)
     if not daemon_active:
         return ("stopped", "Immich server is not reachable.\nThe Docker daemon is not running.",
                 "immich-photos server start")
     if not port_open:
         return ("stopped", "Immich server is not reachable.\nDocker container immich_server is stopped.",
                 "immich-photos server start")
+    if holder != "trusted":
+        return ("problem", "Immich server is not verified.\nPort %d is open, but its listener cannot be confirmed "
+                "as Docker's or yours, so nothing is sent to it." % port, "immich-photos diagnostics")
     return ("problem", "Immich server is not answering.\nThe port is open but the API does not respond; "
             "the server may still be starting.", "immich-photos server logs")
 
@@ -628,6 +738,7 @@ def collect_status(installation=None):
     direct = docker_direct()
     api_key = read_api_key()
     api = ImmichApi("http://127.0.0.1:%d" % port, api_key)
+    holder = port_holder(port)
     notes = []
     library_bytes = None
 
@@ -636,7 +747,7 @@ def collect_status(installation=None):
         "installed": installation.installed,
         "composeDir": str(installation.compose_dir) if installation.installed else None,
         "server": {"online": False, "version": None, "initialized": None, "maintenanceMode": None,
-                   "port": port, "portListening": port_listening(port), "lanIp": address,
+                   "port": port, "portListening": port_listening(port), "portHolder": holder, "lanIp": address,
                    "localUrl": local_url, "url": "http://%s:%d" % (address, port) if address else None},
         "docker": {"installed": docker_installed(), "daemonActive": docker_daemon_active(),
                    "enabledAtBoot": docker_enabled_at_boot(), "direct": direct,
@@ -653,7 +764,7 @@ def collect_status(installation=None):
     }
     server = status["server"]
 
-    if installation.installed:
+    if installation.installed and holder == "trusted":
         try:
             server["online"] = api.ping()
         except ApiError:
@@ -704,7 +815,7 @@ def collect_status(installation=None):
     pending = (status["jobs"] or {}).get("pending", 0)
     state, message, suggestion = derive_state(
         installation.installed, status["docker"]["installed"], status["docker"]["daemonActive"],
-        server["portListening"], server["online"], bool(server["maintenanceMode"]), pending)
+        server["portListening"], server["online"], bool(server["maintenanceMode"]), pending, holder, port)
     status.update(state=state, message=message, suggestion=suggestion)
     return status
 
@@ -1265,6 +1376,8 @@ def print_diagnostics(status, installation):
     section("Network", [
         ("LAN IP", server["lanIp"] or "none found"),
         ("Port %d" % server["port"], "listening" if server["portListening"] else "closed"),
+        ("Port held by", {"trusted": "Docker or you", "foreign": "ANOTHER USER (nothing is sent to it)",
+                          "unknown": "nobody" if not server["portListening"] else "not verifiable"}[server["portHolder"]]),
     ])
     database = status["database"]
     section("Database", [("Status", "healthy (inferred: server is answering)"
@@ -1455,6 +1568,8 @@ def main(argv=None):
         except ApiError as error:
             if error.kind in ("unauthorized", "forbidden"):
                 fail("Immich rejected this key. Nothing was saved.")
+            if error.kind == "untrusted":
+                fail("%s Nothing was saved." % error, "Find its owner with: ss -ltne | grep :%d" % installation.port)
             print("Immich is not reachable right now; the key is saved unchecked.", file=sys.stderr)
         config_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
         write_private(path, key + "\n")
@@ -1463,6 +1578,10 @@ def main(argv=None):
 
     if command == "open":
         url = "http://localhost:%d" % installation.port
+        if port_holder(installation.port) == "foreign":
+            # The browser would hand its Immich session to whoever listens there.
+            fail("Port %d is held by a program of another user, not by Immich. The gallery was not opened."
+                 % installation.port, "Find its owner with: ss -ltne | grep :%d" % installation.port)
         # Omarchy's web app launcher gives the gallery its own window without
         # browser chrome; a plain browser tab is the fallback.
         launcher = None if args.browser else shutil.which("omarchy-launch-webapp")

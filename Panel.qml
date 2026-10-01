@@ -65,6 +65,10 @@ Panel {
         : "Immich is not reachable. The Docker service is not running."
     }
     if (serverState === "problem") {
+      if (status.server.portHolder === "foreign")
+        return "Port " + status.server.port + " is held by a program of another user, not by Immich. Nothing is sent to it."
+      if (status.server.portHolder !== "trusted")
+        return "The port is open, but its listener cannot be confirmed as Docker's or yours. Nothing is sent to it."
       return status.server.maintenanceMode
         ? "Immich is in maintenance mode. Open the web interface to end it."
         : "The port is open but Immich does not answer. The server may still be starting."

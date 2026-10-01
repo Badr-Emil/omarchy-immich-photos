@@ -139,6 +139,25 @@ only if they are UUIDs, because they become part of URLs and file names.
 Deleting always means Immich's trash; the backend has no code path for
 permanent deletion or for emptying the trash.
 
+## Who answers on the port
+
+Immich's port 2283 is unprivileged: while the containers are stopped, any
+local user may bind it and answer like Immich. A ping or version reply proves
+nothing, so the backend identifies the listener by its owner instead. Before
+a connection, and again once it is established, it reads `/proc/net/tcp` and
+`/proc/net/tcp6` and requires every socket listening for `127.0.0.1:<port>`
+to belong to root (Docker's port publishing) or to the current user (rootless
+Docker). Otherwise the request is not written to the socket; this covers the
+status timer, `api-key set`, the gallery and `server start|restart`. The API
+client also ignores proxy settings and does not follow redirects, so the key
+cannot travel to an address that was not checked. `immich-photos open`
+refuses to open the browser on a foreign listener for the same reason.
+
+The status reports the result as `server.portHolder`: `trusted`, `foreign`,
+or `unknown` (nothing listening, or the table is not readable). A setup that
+forwards the port without any listening socket in the host's network
+namespace cannot be verified and is treated as `unknown`.
+
 ## Privileges
 
 Docker actions that change something go through one function that first

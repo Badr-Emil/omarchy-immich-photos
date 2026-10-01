@@ -277,6 +277,19 @@ class StatusParsing(unittest.TestCase):
         state, message, _ = ip.derive_state(True, True, False, False, False)
         self.assertIn("Docker daemon is not running", message)
 
+    def test_state_foreign_listener_is_named_even_when_docker_is_stopped(self):
+        for daemon_active in (True, False):
+            state, message, suggestion = ip.derive_state(True, True, daemon_active, True, False, holder="foreign",
+                                                         port=2283)
+            self.assertEqual(state, "problem")
+            self.assertIn("another user", message)
+            self.assertIn("2283", suggestion)
+
+    def test_state_unverified_listener(self):
+        state, message, _ = ip.derive_state(True, True, True, True, False, holder="unknown")
+        self.assertEqual(state, "problem")
+        self.assertIn("cannot be confirmed", message)
+
     def test_state_port_open_but_no_answer(self):
         state, _, suggestion = ip.derive_state(True, True, True, True, False)
         self.assertEqual(state, "problem")
@@ -351,8 +364,10 @@ class NetworkAddress(unittest.TestCase):
 class FakeImmich(BaseHTTPRequestHandler):
     routes = {}
     writes = []
+    requests = []
 
     def do_GET(self):
+        FakeImmich.requests.append((self.path, self.headers.get("x-api-key")))
         status, body, needs_key = self.routes.get(self.path, (404, {"message": "Not found"}, False))
         if needs_key and self.headers.get("x-api-key") != "valid-key":
             status, body = 401, {"message": "Invalid API key"}
@@ -366,6 +381,7 @@ class FakeImmich(BaseHTTPRequestHandler):
     def respond_to_write(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"null")
+        FakeImmich.requests.append((self.path, self.headers.get("x-api-key")))
         FakeImmich.writes.append((self.command, self.path, body))
         key = "%s %s" % (self.command, self.path)
         status, answer, needs_key = self.routes.get(key, (404, {"message": "Not found"}, False))
@@ -401,6 +417,7 @@ class WithFakeImmich(IsolatedHome):
         super().setUp()
         FakeImmich.routes = dict(self.ROUTES)
         FakeImmich.writes = []
+        FakeImmich.requests = []
         self.server = HTTPServer(("127.0.0.1", 0), FakeImmich)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -476,6 +493,185 @@ class ApiErrors(WithFakeImmich):
     def test_error_messages_never_contain_the_key(self):
         error = self.error("/server/statistics", api_key="wrong-secret-key")
         self.assertNotIn("wrong-secret-key", str(error))
+
+
+SOCKET_TABLE_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+                       "   uid  timeout inode\n")
+
+
+def socket_row(address, port, uid, state="0A"):
+    remote = "0" * len(address) + ":0000"
+    return "   0: %s:%04X %s %s 00000000:00000000 00:00000000 00000000 %5d        0 4711 1 0000000000000000 100\n" % (
+        address, port, remote, state, uid)
+
+
+class PortOwnership(IsolatedHome):
+    LOOPBACK = ip.kernel_hex(bytes([127, 0, 0, 1]))
+    ANY = "00000000"
+    ANY6 = "0" * 32
+
+    def owners(self, v4="", v6=None):
+        tables = [self.home / "tcp", self.home / "tcp6"]
+        tables[0].write_text(SOCKET_TABLE_HEADER + v4)
+        if v6 is not None:
+            tables[1].write_text(SOCKET_TABLE_HEADER + v6)
+        return ip.listener_owners(2283, tables)
+
+    def holder(self, owners):
+        with mock.patch.object(ip, "listener_owners", return_value=owners):
+            return ip.port_holder(2283)
+
+    def test_owner_of_the_listening_socket_is_read(self):
+        self.assertEqual(self.owners(socket_row(self.ANY, 2283, 0)), {0})
+        self.assertEqual(self.owners(socket_row(self.LOOPBACK, 2283, 1001)), {1001})
+
+    def test_dual_stack_listener_counts(self):
+        mapped = ip.kernel_hex(bytes(10) + b"\xff\xff" + bytes([127, 0, 0, 1]))
+        self.assertEqual(self.owners(v6=socket_row(self.ANY6, 2283, 1001)), {1001})
+        self.assertEqual(self.owners(socket_row(self.ANY, 2283, 0), socket_row(mapped, 2283, 1001)), {0, 1001})
+
+    def test_other_ports_addresses_and_connections_do_not_count(self):
+        rows = (socket_row(self.ANY, 2284, 1001)
+                + socket_row(ip.kernel_hex(bytes([192, 168, 0, 12])), 2283, 1001)
+                + socket_row(self.LOOPBACK, 2283, 1001, state="01"))
+        ipv6_loopback = socket_row(ip.kernel_hex(bytes(15) + b"\x01"), 2283, 1001)
+        self.assertEqual(self.owners(rows, ipv6_loopback), set())
+
+    def test_unreadable_table_is_not_an_empty_one(self):
+        self.assertIsNone(ip.listener_owners(2283, [self.home / "missing"]))
+        self.assertEqual(self.owners(socket_row(self.ANY, 2283, 0)), {0})  # no tcp6 without IPv6
+
+    def test_only_root_and_this_user_are_trusted(self):
+        self.assertEqual(self.holder({0}), "trusted")
+        self.assertEqual(self.holder({os.getuid()}), "trusted")
+        self.assertEqual(self.holder({0, os.getuid()}), "trusted")
+        self.assertEqual(self.holder({os.getuid() + 1}), "foreign")
+        self.assertEqual(self.holder({0, os.getuid() + 1}), "foreign")
+        self.assertEqual(self.holder(set()), "unknown")
+        self.assertEqual(self.holder(None), "unknown")
+
+    def test_real_socket_table_knows_a_listener_of_this_user(self):
+        server = HTTPServer(("127.0.0.1", 0), FakeImmich)
+        self.addCleanup(server.server_close)
+        self.assertEqual(ip.listener_owners(server.server_address[1]), {os.getuid()})
+        self.assertEqual(ip.port_holder(server.server_address[1]), "trusted")
+
+
+class ForeignListener(WithFakeImmich):
+    """Another local user holds Immich's port: the fake server must hear nothing."""
+
+    FOREIGN = {os.getuid() + 1}
+    KEY = "valid-key-with-enough-characters"
+
+    def foreign(self, owners=None):
+        patcher = mock.patch.object(ip, "listener_owners", **(owners or {"return_value": self.FOREIGN}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_status_sends_nothing_and_reports_the_port(self):
+        self.set_key("valid-key")
+        self.foreign()
+        status = self.status(docker_daemon_active=False)
+        self.assertEqual(FakeImmich.requests, [])
+        self.assertEqual(status["state"], "problem")
+        self.assertEqual(status["server"]["portHolder"], "foreign")
+        self.assertFalse(status["server"]["online"])
+        self.assertIsNone(status["library"])
+        self.assertIn("another user", status["message"])
+
+    def test_api_client_refuses_with_and_without_key(self):
+        self.foreign()
+        for api, authenticated in ((ip.ImmichApi(self.url), False), (ip.ImmichApi(self.url, "valid-key"), True)):
+            with self.assertRaises(ip.ApiError) as caught:
+                api.get("/server/statistics", authenticated=authenticated)
+            self.assertEqual(caught.exception.kind, "untrusted")
+        self.assertEqual(FakeImmich.requests, [])
+
+    def test_listener_swapped_while_connecting_gets_nothing(self):
+        self.foreign({"side_effect": [{0}, self.FOREIGN]})
+        with self.assertRaises(ip.ApiError) as caught:
+            ip.ImmichApi(self.url, "valid-key").get("/server/statistics", authenticated=True)
+        self.assertEqual(caught.exception.kind, "untrusted")
+        self.assertEqual(FakeImmich.requests, [])
+
+    def test_unverifiable_listener_gets_nothing(self):
+        self.foreign({"return_value": None})
+        with self.assertRaises(ip.ApiError) as caught:
+            ip.ImmichApi(self.url, "valid-key").get("/server/statistics", authenticated=True)
+        self.assertEqual(caught.exception.kind, "unreachable")
+        self.assertEqual(FakeImmich.requests, [])
+        self.assertEqual(self.status()["state"], "problem")
+        self.assertEqual(FakeImmich.requests, [])
+
+    def run_main(self, arguments, stdin=""):
+        output = io.StringIO()
+        with mock.patch.object(ip, "find_installation", return_value=self.installation()), \
+                mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                contextlib.redirect_stderr(output), contextlib.redirect_stdout(output):
+            try:
+                code = ip.main(arguments)
+            except SystemExit as error:
+                code = error.code
+        return code, output.getvalue()
+
+    def test_key_validation_does_not_send_the_new_key(self):
+        self.foreign()
+        code, output = self.run_main(["api-key", "set"], self.KEY + "\n")
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing was saved", output)
+        self.assertEqual(FakeImmich.requests, [])
+        self.assertFalse((ip.config_dir() / "api-key").exists())
+
+    def test_key_validation_still_reaches_immich(self):
+        FakeImmich.routes["/api/api-keys/me"] = (200, {"id": "1"}, False)
+        code, _ = self.run_main(["api-key", "set"], self.KEY + "\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(FakeImmich.requests, [("/api/api-keys/me", self.KEY)])
+
+    def test_gallery_reports_it(self):
+        self.set_key("valid-key")
+        self.foreign()
+        code, output = self.run_main(["gallery", "albums"])
+        self.assertEqual(json.loads(output)["error"]["kind"], "untrusted")
+        self.assertEqual(FakeImmich.requests, [])
+
+    def test_browser_is_not_opened(self):
+        self.foreign()
+        with mock.patch.object(ip.subprocess, "Popen") as popen:
+            code, output = self.run_main(["open"])
+        self.assertEqual(code, 1)
+        popen.assert_not_called()
+
+    def test_waiting_for_a_start_sends_nothing(self):
+        self.foreign()
+        with mock.patch.object(ip.time, "sleep"):
+            self.assertFalse(ip.wait_until_online(self.installation(), seconds=0.2))
+        self.assertEqual(FakeImmich.requests, [])
+
+
+class KeyStaysOnTheCheckedPort(WithFakeImmich):
+    def test_redirect_is_not_followed(self):
+        other = HTTPServer(("127.0.0.1", 0), FakeImmich)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+
+        class Redirecting(FakeImmich):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:%d/api/server/statistics" % other.server_address[1])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.server.RequestHandlerClass = Redirecting
+        with self.assertRaises(ip.ApiError) as caught:
+            ip.ImmichApi(self.url, "valid-key").get("/server/statistics", authenticated=True)
+        self.assertEqual((caught.exception.kind, caught.exception.status), ("http", 302))
+        self.assertEqual(FakeImmich.requests, [])
+
+    def test_proxy_settings_are_ignored(self):
+        with mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:9", "HTTP_PROXY": "http://127.0.0.1:9"}):
+            self.assertTrue(ip.ImmichApi(self.url).ping())
 
 
 class StatusCollection(WithFakeImmich):

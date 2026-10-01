@@ -28,6 +28,11 @@ mode. Right after a start that is normal. Otherwise:
 immich-photos server logs
 ```
 
+If the panel says the port is held by a program of another user, something
+other than Immich is listening on port 2283. The plugin sends it nothing.
+`ss -ltne | grep :2283` shows the owner's user id; Immich can start again
+once that program is gone.
+
 ## The phone cannot find the server
 
 1. Is the phone on the same Wi-Fi? Guest networks often isolate devices.

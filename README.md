@@ -157,6 +157,10 @@ state but does not set one up: [docs/backup.md](docs/backup.md)
   password
 - The database password and the API key are stored in files with mode 600,
   never in QML, logs or Git
+- Before anything is sent to port 2283, the kernel's socket table must show
+  that the listener belongs to root (Docker) or to you. A program of another
+  local user that takes the port while Immich is stopped gets no request and
+  no API key, and the panel reports it
 - No telemetry
 
 ## Command line
